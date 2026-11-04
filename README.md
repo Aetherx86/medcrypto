@@ -263,6 +263,12 @@ The pipeline executes on every push and pull request to `main` and `master` bran
 
 ---
 
-## 8. License
+## 8. Author
 
-This project is licensed under the terms of the MIT License. See the [LICENSE](LICENSE) file for details.
+Jeong Hoon Kim
+
+---
+
+## 9. License
+
+MIT License. See the [LICENSE](LICENSE) file for details.

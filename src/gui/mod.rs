@@ -195,7 +195,7 @@ impl eframe::App for MedCryptaApp {
             ui.horizontal(|ui| {
                 ui.label("Cryptographic Primitives: Ring-LWE CKKS (N=128, q=30-bit)  |  SHA-256 Merkle Chain  |  Pedersen Fiat-Shamir");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label("License: MIT  |  Author: Jeong Hoon Kim");
+                    ui.label("Jeong Hoon Kim");
                 });
             });
         });
