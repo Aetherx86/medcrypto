@@ -41,7 +41,23 @@ MedCrypta evaluates and implements quantum-resilient cryptographic foundations t
 
 ---
 
-## 3. Installation and Build
+## 3. Clinical AI Longitudinal Recommender Engine (VITA & COGNet)
+
+MedCrypta unifies privacy compliance (HIPAA Minimum Necessary & GDPR Data Minimization) with state-of-the-art clinical deep learning on longitudinal electronic health records (MIMIC-III benchmark, GAMENet, LEAP, SafeDrug, COGNet):
+
+1. Component 1: Relevant Past Visit Selection & Target-Aware Attention (VITA, AAAI 2024):
+   - Rather than unconditionally concatenating all historical encounters (which injects clinical noise and violates data minimization), MedCrypta ranks past visits by cosine similarity to the current encounter.
+   - Empirical validation: Selecting the Top-1 clinically relevant visit achieves superior Jaccard similarity and PR-AUC, whereas incorporating irrelevant past visits (Bot-1) degrades representation below the baseline.
+2. Component 2: COGNet-Inspired Copy-or-Generate Predictor:
+   - Evaluates multi-label medication regimens by balancing a Copy mechanism (repeating maintenance drugs from pertinent past visits) and a Generate mechanism (acute prescriptions derived from current diagnoses).
+3. Benchmarks & Evaluation Metrics:
+   - Jaccard Similarity: Ratio of intersection to union over prescribed vs ground-truth medication sets.
+   - PR-AUC: Area under the Precision-Recall curve via rank-ordered average precision.
+   - F1-Score: Harmonic balance of clinical precision and recall.
+
+---
+
+## 4. Installation and Build
 
 ### Prerequisites
 - Rust toolchain: stable (1.80+ recommended, tested on Rust 1.99+)
@@ -60,30 +76,35 @@ The optimized binary will be produced at `target/release/medcrypta`.
 
 ---
 
-## 4. Test Suite Execution
+## 5. Test Suite Execution
 
-The test suite validates both mathematical correctness and regulatory compliance invariants:
+The test suite validates both mathematical correctness, regulatory compliance invariants, and clinical AI accuracy:
 
 ```bash
 cargo test --all --verbose
 ```
 
 ### Included Test Modules:
-1. `tests/gdpr_compliance_test.rs`:
+1. `tests/clinical_ai_recommender_test.rs`:
+   - Validates Relevant Past Visit Selection and Target-Aware Cross Attention.
+   - Validates COGNet Copy-or-Generate Multi-Label medication predictor.
+   - Evaluates Jaccard Similarity, PR-AUC, and F1-score across longitudinal benchmarks.
+   - Empirically verifies the VITA hypothesis (Top-1 relevant past visit strictly outperforms Bot-1 noise).
+2. `tests/gdpr_compliance_test.rs`:
    - Validates GDPR Article 17 Cryptographic Shredding (ensures decryption is permanently blocked post-erasure).
    - Validates GDPR Article 25 Zero-PHI invariant (ensures no medical identifiers or measurements appear in serialized blockchain states).
-2. `tests/hipaa_compliance_test.rs`:
+3. `tests/hipaa_compliance_test.rs`:
    - Validates HIPAA Minimum Necessary Rule (ensures ZKP proofs reveal zero clinical numerical values).
    - Validates HIPAA Accounting of Disclosures (ensures single-byte tampering in the audit log triggers immediate cryptographic verification failure).
-3. `tests/fhe_ckks_test.rs`:
+4. `tests/fhe_ckks_test.rs`:
    - Validates multi-slot clinical vector encryption/decryption accuracy within floating-point error bounds.
    - Validates multi-hospital federated averaging on ciphertexts.
-4. `tests/quantum_resistance_test.rs`:
+5. `tests/quantum_resistance_test.rs`:
    - Verifies RLWE lattice hardness parameters and Grover 128-bit quantum search bounds.
 
 ---
 
-## 5. Command-Line Interface (CLI) & Native GUI Usage
+## 6. Command-Line Interface (CLI) & Native GUI Usage
 
 ### 5.1 Launch Native Desktop Graphical User Interface (GUI)
 MedCrypta features a high-performance native desktop GUI built with `egui` and `eframe` (no HTML/Electron/WebView). It provides interactive visual dashboards for EMR ingestion, real-time CKKS polynomial encryption, ZKP proof generation and verification, multi-hospital federated computing, GDPR cryptographic shredding, and post-quantum parameter inspection:
@@ -193,14 +214,14 @@ Audit Signature:  0x9482bf1024cd9a88e...
 The associated ciphertext on storage/blockchain is now mathematically unrecoverable.
 ```
 
-### 5.6 Post-Quantum Security Audit
+### 6.6 Post-Quantum Security Audit
 Displays security assessment table and quantum parameter validations:
 
 ```bash
 ./target/release/medcrypta quantum-audit
 ```
 
-### 5.7 Run Full Multi-Institutional Interactive Simulation
+### 6.7 Run Full Multi-Institutional Interactive Simulation
 Simulates the entire multi-hospital lifecycle (DID registration, dynamic consent, ZKP screening, FHE federated average, audit trail, and crypto-shredding):
 
 ```bash
@@ -209,7 +230,7 @@ Simulates the entire multi-hospital lifecycle (DID registration, dynamic consent
 
 ---
 
-## 6. Rust Library Integration Example
+## 7. Rust Library Integration Example
 
 MedCrypta can be embedded directly into existing hospital health information systems (HIS / EMR):
 
@@ -250,7 +271,7 @@ fn main() {
 
 ---
 
-## 7. Continuous Integration Workflow
+## 8. Continuous Integration Workflow
 
 The package includes a comprehensive GitHub Actions workflow configured at `.github/workflows/ci.yml`.
 
@@ -263,12 +284,12 @@ The pipeline executes on every push and pull request to `main` and `master` bran
 
 ---
 
-## 8. Author
+## 9. Author
 
 Jeong Hoon Kim
 
 ---
 
-## 9. License
+## 10. License
 
 MIT License. See the [LICENSE](LICENSE) file for details.

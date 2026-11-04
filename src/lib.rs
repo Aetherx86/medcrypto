@@ -1,4 +1,5 @@
 pub mod blockchain;
+pub mod clinical_ai;
 pub mod compliance;
 pub mod fhe;
 pub mod gui;
