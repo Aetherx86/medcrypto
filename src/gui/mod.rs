@@ -1,4 +1,7 @@
 use crate::blockchain::{BlockchainConsentRegistry, EntityRole};
+use crate::clinical_ai::{
+    ClinicalVisit, EvaluationMetrics, RelevantVisitSelector, TwoLevelAutoregressivePredictor,
+};
 use crate::compliance::{AuditLedger, KeyManager};
 use crate::fhe::CKKSEngine;
 use crate::models::PatientRecord;
@@ -14,6 +17,7 @@ enum ActiveTab {
     FederatedFhe,
     ComplianceShredding,
     QuantumAudit,
+    ClinicalAi,
 }
 
 pub struct MedCryptoApp {
@@ -61,6 +65,18 @@ pub struct MedCryptoApp {
     envelope: Option<crate::compliance::EncryptedEnvelope>,
     shredding_status_msg: String,
     audit_ledger: AuditLedger,
+
+    // Clinical AI (VITA + COGNet)
+    clinical_past_visits: Vec<ClinicalVisit>,
+    clinical_current_visit: ClinicalVisit,
+    clinical_mode: usize,
+    clinical_recommended_drugs: Vec<String>,
+    clinical_ground_truth_drugs: Vec<String>,
+    clinical_jaccard: f64,
+    clinical_prauc: f64,
+    clinical_f1: f64,
+    clinical_ddi_rate: f64,
+    clinical_status_msg: String,
 }
 
 impl Default for MedCryptoApp {
@@ -141,6 +157,46 @@ impl Default for MedCryptoApp {
             envelope: None,
             shredding_status_msg: "No record currently enveloped".to_string(),
             audit_ledger,
+
+            clinical_past_visits: vec![
+                ClinicalVisit::new(
+                    "visit-01 (Top-1: Chronic T2DM)",
+                    1,
+                    vec!["DIABETES_T2", "HYPERLIPIDEMIA"],
+                    vec!["HBA1C_ASSAY"],
+                    vec!["INSULIN_GLARGINE", "METFORMIN", "ATORVASTATIN"],
+                    vec![0.90, 0.85, 0.15, 0.08],
+                ),
+                ClinicalVisit::new(
+                    "visit-02 (Bot-1: Fracture Noise)",
+                    2,
+                    vec!["FRACTURE_CLAVICLE"],
+                    vec!["XRAY_CHEST", "SPLINT_IMMOBILIZATION"],
+                    vec!["IBUPROFEN", "ACETAMINOPHEN"],
+                    vec![0.05, 0.02, 0.95, 0.91],
+                ),
+            ],
+            clinical_current_visit: ClinicalVisit::new(
+                "visit-03 (Current Encounter)",
+                3,
+                vec!["DIABETES_T2_ACUTE", "HYPERTENSION_STAGE2"],
+                vec!["GLUCOSE_MONITORING", "ECG"],
+                vec!["INSULIN_GLARGINE", "LISINOPRIL", "METFORMIN"],
+                vec![0.92, 0.88, 0.12, 0.05],
+            ),
+            clinical_mode: 0,
+            clinical_recommended_drugs: Vec::new(),
+            clinical_ground_truth_drugs: vec![
+                "INSULIN_GLARGINE".to_string(),
+                "LISINOPRIL".to_string(),
+                "METFORMIN".to_string(),
+            ],
+            clinical_jaccard: 0.0,
+            clinical_prauc: 0.0,
+            clinical_f1: 0.0,
+            clinical_ddi_rate: 0.0,
+            clinical_status_msg: "Select inference mode and click 'Run Clinical AI Recommendation'"
+                .to_string(),
         }
     }
 }
@@ -186,6 +242,11 @@ impl eframe::App for MedCryptoApp {
                     ActiveTab::QuantumAudit,
                     "Post-Quantum Security",
                 );
+                ui.selectable_value(
+                    &mut self.active_tab,
+                    ActiveTab::ClinicalAi,
+                    "Clinical AI (VITA/COGNet)",
+                );
             });
             ui.add_space(8.0);
         });
@@ -209,6 +270,7 @@ impl eframe::App for MedCryptoApp {
                 ActiveTab::FederatedFhe => self.render_federated_fhe(ui),
                 ActiveTab::ComplianceShredding => self.render_compliance(ui),
                 ActiveTab::QuantumAudit => self.render_quantum_audit(ui),
+                ActiveTab::ClinicalAi => self.render_clinical_ai(ui),
             });
         });
     }
@@ -620,6 +682,189 @@ impl MedCryptoApp {
             for rec in &report.post_quantum_recommendations {
                 ui.label(format!("• {}", rec));
             }
+        });
+    }
+
+    fn render_clinical_ai(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Clinical AI Longitudinal Medication Recommender");
+        ui.label("Combines Straight-Through Gumbel-Softmax relevant visit selection (VITA) with Two-Level Autoregressive generation (COGNet) and DDI suppression.");
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
+            ui.strong("Longitudinal EHR Trajectory (Patient MIMIC-III Benchmark Profile):");
+            egui::Grid::new("clinical_trajectory_grid")
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Visit");
+                    ui.label("Clinical Diagnoses");
+                    ui.label("Procedures");
+                    ui.label("Historical Meds / Ground Truth");
+                    ui.end_row();
+
+                    for past in &self.clinical_past_visits {
+                        ui.label(&past.visit_id);
+                        ui.label(past.diagnoses.join(", "));
+                        ui.label(past.procedures.join(", "));
+                        ui.label(past.medications.join(", "));
+                        ui.end_row();
+                    }
+
+                    ui.strong(&self.clinical_current_visit.visit_id);
+                    ui.strong(self.clinical_current_visit.diagnoses.join(", "));
+                    ui.strong(self.clinical_current_visit.procedures.join(", "));
+                    ui.strong(self.clinical_ground_truth_drugs.join(", "));
+                    ui.end_row();
+                });
+        });
+
+        ui.add_space(10.0);
+        ui.group(|ui| {
+            ui.strong("Inference Context Selection Mode:");
+            ui.label("Select how longitudinal past history is aggregated into the patient representation:");
+
+            ui.radio_value(
+                &mut self.clinical_mode,
+                0,
+                "Top-1 Relevant Past Visit (VITA Target-Aware Cross-Attention)",
+            );
+            ui.radio_value(
+                &mut self.clinical_mode,
+                1,
+                "All Historical Visits (GAMENet / Standard Longitudinal RNN)",
+            );
+            ui.radio_value(
+                &mut self.clinical_mode,
+                2,
+                "No Past History (Static Single-Encounter Snapshot)",
+            );
+            ui.radio_value(
+                &mut self.clinical_mode,
+                3,
+                "Bot-1 Irrelevant Past Visit (Orthopedic Fracture Distractor Noise)",
+            );
+
+            ui.add_space(6.0);
+            if ui
+                .button("Run Clinical AI Recommendation & Benchmark")
+                .clicked()
+            {
+                let drug_vocab = vec![
+                    "INSULIN_GLARGINE",
+                    "LISINOPRIL",
+                    "METFORMIN",
+                    "ATORVASTATIN",
+                    "IBUPROFEN",
+                    "ACETAMINOPHEN",
+                    "WARFARIN",
+                    "ASPIRIN",
+                ];
+
+                let selected: Vec<&ClinicalVisit> = match self.clinical_mode {
+                    0 => RelevantVisitSelector::select_top_k(
+                        &self.clinical_current_visit,
+                        &self.clinical_past_visits,
+                        1,
+                    ),
+                    1 => self.clinical_past_visits.iter().collect(),
+                    2 => Vec::new(),
+                    3 => {
+                        let ranked = RelevantVisitSelector::rank_visits(
+                            &self.clinical_current_visit,
+                            &self.clinical_past_visits,
+                        );
+                        ranked.last().map(|(v, _)| vec![*v]).unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+
+                let predictor = TwoLevelAutoregressivePredictor::new(drug_vocab);
+                let (prescribed, probs) = predictor.autoregressive_decode(
+                    &self.clinical_current_visit,
+                    &selected,
+                    6,
+                );
+
+                self.clinical_jaccard =
+                    EvaluationMetrics::jaccard(&self.clinical_ground_truth_drugs, &prescribed);
+                self.clinical_prauc =
+                    EvaluationMetrics::pr_auc(&self.clinical_ground_truth_drugs, &probs);
+                self.clinical_f1 =
+                    EvaluationMetrics::f1_score(&self.clinical_ground_truth_drugs, &prescribed);
+                self.clinical_ddi_rate = predictor.ddi_graph.evaluate_ddi_rate(&prescribed);
+                self.clinical_recommended_drugs = prescribed;
+
+                let mode_name = match self.clinical_mode {
+                    0 => "Top-1 Relevant Visit (VITA)",
+                    1 => "All Visits (GAMENet)",
+                    2 => "No History (Static)",
+                    3 => "Bot-1 Irrelevant Visit (Noise)",
+                    _ => "Unknown",
+                };
+                self.clinical_status_msg = format!("Inference complete under mode: {}", mode_name);
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.group(|ui| {
+            ui.strong("Recommendation Output & Performance Benchmark:");
+            ui.label(format!("Status: {}", self.clinical_status_msg));
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                ui.label("Prescribed Medication Regimen:");
+                if self.clinical_recommended_drugs.is_empty() {
+                    ui.label("(None yet generated)");
+                } else {
+                    for drug in &self.clinical_recommended_drugs {
+                        ui.colored_label(egui::Color32::LIGHT_BLUE, drug);
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            egui::Grid::new("metrics_display_grid")
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Evaluation Metric");
+                    ui.label("Observed Score");
+                    ui.label("Clinical Significance");
+                    ui.end_row();
+
+                    ui.label("Jaccard Similarity:");
+                    ui.strong(format!("{:.4}", self.clinical_jaccard));
+                    ui.label("Exact overlap of multi-label medication sets");
+                    ui.end_row();
+
+                    ui.label("PR-AUC (Average Precision):");
+                    ui.strong(format!("{:.4}", self.clinical_prauc));
+                    ui.label("Ranked discrimination under class imbalance");
+                    ui.end_row();
+
+                    ui.label("F1-Score:");
+                    ui.strong(format!("{:.4}", self.clinical_f1));
+                    ui.label("Harmonic balance of clinical precision & recall");
+                    ui.end_row();
+
+                    ui.label("Adverse DDI Rate:");
+                    ui.colored_label(
+                        if self.clinical_ddi_rate == 0.0 {
+                            egui::Color32::GREEN
+                        } else {
+                            egui::Color32::RED
+                        },
+                        format!("{:.2}%", self.clinical_ddi_rate * 100.0),
+                    );
+                    ui.label("Safety compliance across TWOSIDES DDI graph");
+                    ui.end_row();
+                });
+        });
+
+        ui.add_space(10.0);
+        ui.group(|ui| {
+            ui.strong("VITA Empirical Findings & Regulatory Data Minimization Invariant:");
+            ui.label("1. PQ1 (Longitudinal Context): Incorporating past clinical history provides critical context over static snapshots (All > No).");
+            ui.label("2. PQ2 (Relevance Degree & Historical Noise): Unconditionally aggregating all past records through standard RNNs introduces irrelevant noise (Bot-1 < No < All <= Top-1).");
+            ui.label("3. Selective Target-Aware Extraction: Isolating Top-1 relevant encounters maximizes recommendation accuracy while enforcing HIPAA Minimum Necessary §164.502(b) and GDPR Article 5(1)(c) Data Minimization.");
         });
     }
 }

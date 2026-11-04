@@ -541,6 +541,10 @@ impl EvaluationMetrics {
         }
     }
 
+    pub fn f1_score(ground_truth: &[String], predicted: &[String]) -> f64 {
+        Self::f1(ground_truth, predicted)
+    }
+
     /// Standard Average Precision (PR-AUC): AP = (1 / |GT|) * sum_{k in GT} Precision@rank(k)
     pub fn pr_auc(ground_truth: &[String], prediction_scores: &HashMap<String, f64>) -> f64 {
         let gt_set: HashSet<&String> = ground_truth.iter().collect();

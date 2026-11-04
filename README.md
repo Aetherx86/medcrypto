@@ -104,18 +104,36 @@ cargo test --all --verbose
 
 ---
 
-## 6. Command-Line Interface (CLI) & Native GUI Usage
+## 6. Command-Line Interface (CLI), GUI & Examples
 
-### 5.1 Launch Native Desktop Graphical User Interface (GUI)
-MedCrypto features a high-performance native desktop GUI built with `egui` and `eframe` (no HTML/Electron/WebView). It provides interactive visual dashboards for EMR ingestion, real-time CKKS polynomial encryption, ZKP proof generation and verification, multi-hospital federated computing, GDPR cryptographic shredding, and post-quantum parameter inspection:
+### 6.1 Launch Native Desktop Graphical User Interface (GUI)
+MedCrypto features a high-performance native desktop GUI built with `egui` and `eframe` (no HTML/Electron/WebView). It provides 7 interactive visual dashboards:
+1. Dashboard Overview: Consortium node status, W3C DID document inspection, and dynamic patient consent management.
+2. EMR & 4th Gen FHE: Live clinical vital sliders and real-time Ring-LWE CKKS polynomial ciphertext generation.
+3. ZKP Selective Disclosure: Interactive zero-knowledge predicate proof generation and verification for clinical trials.
+4. Multi-Hospital Analytics: Multi-hospital encrypted federated averaging over CKKS ciphertexts without decrypting records.
+5. GDPR & HIPAA Audit: Ephemeral key envelope encryption, cryptographic shredding (GDPR Article 17), and chained SHA-256 disclosure log verification (HIPAA Section 164.528).
+6. Post-Quantum Security: Ring-LWE parameter auditor and Grover/Shor quantum resistance analysis.
+7. Clinical AI (VITA/COGNet): Interactive longitudinal EHR medication recommendation benchmarking comparing Top-1, All, No-History, and Bot-1 with real-time Jaccard, PR-AUC, F1, and DDI safety scoring.
 
 ```bash
+# Launch GUI via CLI binary
 ./target/release/medcrypto gui
-# Or simply run without arguments:
+# Or launch directly with no arguments:
 ./target/release/medcrypto
+
+# Or launch via cargo example:
+cargo run --example gui_launcher
 ```
 
-### 5.2 Initialize Hospital Node Cryptography
+### 6.2 Run Clinical AI Longitudinal Recommender Benchmark Example
+Executes a standalone benchmark evaluating VITA Relevant Visit Selection and COGNet Two-Level Autoregressive generation on an empirical MIMIC-III trajectory:
+
+```bash
+cargo run --example clinical_ai_benchmark
+```
+
+### 6.3 Initialize Hospital Node Cryptography
 Generates node identity, W3C DID document, and 4th Gen CKKS public/private keypairs:
 
 ```bash
@@ -136,7 +154,7 @@ Public Key Hash:  0x000000003e165c4e
 [SUCCESS] Node cryptographic identity successfully initialized.
 ```
 
-### 5.2 Encrypt Clinical Record via CKKS FHE
+### 6.4 Encrypt Clinical Record via CKKS FHE
 Converts patient clinical vitals (Age, Systolic BP, Diastolic BP, Glucose, HbA1c, BMI, eGFR, LDL) into an encrypted CKKS vector:
 
 ```bash
@@ -154,7 +172,7 @@ Example Output:
 [SUCCESS] Ciphertext written to ./ciphertext_p8001.json
 ```
 
-### 5.3 Generate Zero-Knowledge Proof for Clinical Condition
+### 6.5 Generate Zero-Knowledge Proof for Clinical Condition
 Generates a non-interactive zero-knowledge proof that a patient's HbA1c is below the diabetic threshold (<= 6.5%) without disclosing their actual measurement (e.g., 5.8%):
 
 ```bash
@@ -179,7 +197,7 @@ Challenge (c):    9182529740541274439
 Proof saved to ./zkp_hba1c_proof.json
 ```
 
-### 5.4 Verify Zero-Knowledge Proof
+### 6.6 Verify Zero-Knowledge Proof
 An external hospital or research institution verifies the proof mathematically without access to patient records:
 
 ```bash
@@ -192,7 +210,7 @@ Example Output:
 The claimed condition is satisfied without revealing underlying clinical data.
 ```
 
-### 5.5 GDPR Article 17 Cryptographic Shredding
+### 6.7 GDPR Article 17 Cryptographic Shredding
 Irrevocably destroys the ephemeral key envelope for a specified record upon patient consent withdrawal:
 
 ```bash
@@ -214,14 +232,14 @@ Audit Signature:  0x9482bf1024cd9a88e...
 The associated ciphertext on storage/blockchain is now mathematically unrecoverable.
 ```
 
-### 6.6 Post-Quantum Security Audit
+### 6.8 Post-Quantum Security Audit
 Displays security assessment table and quantum parameter validations:
 
 ```bash
 ./target/release/medcrypto quantum-audit
 ```
 
-### 6.7 Run Full Multi-Institutional Interactive Simulation
+### 6.9 Run Full Multi-Institutional Interactive Simulation
 Simulates the entire multi-hospital lifecycle (DID registration, dynamic consent, ZKP screening, FHE federated average, audit trail, and crypto-shredding):
 
 ```bash
