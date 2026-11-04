@@ -83,9 +83,18 @@ cargo test --all --verbose
 
 ---
 
-## 5. Command-Line Interface (CLI) Usage
+## 5. Command-Line Interface (CLI) & Native GUI Usage
 
-### 5.1 Initialize Hospital Node Cryptography
+### 5.1 Launch Native Desktop Graphical User Interface (GUI)
+MedCrypta features a high-performance native desktop GUI built with `egui` and `eframe` (no HTML/Electron/WebView). It provides interactive visual dashboards for EMR ingestion, real-time CKKS polynomial encryption, ZKP proof generation and verification, multi-hospital federated computing, GDPR cryptographic shredding, and post-quantum parameter inspection:
+
+```bash
+./target/release/medcrypta gui
+# Or simply run without arguments:
+./target/release/medcrypta
+```
+
+### 5.2 Initialize Hospital Node Cryptography
 Generates node identity, W3C DID document, and 4th Gen CKKS public/private keypairs:
 
 ```bash

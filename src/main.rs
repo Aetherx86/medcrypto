@@ -18,11 +18,14 @@ use std::fs;
 #[command(about = "Privacy-Preserving Cross-Institutional Healthcare Data Sharing Engine", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Launch the native desktop graphical user interface (GUI)
+    Gui,
+
     /// Initialize a new hospital node identity, DID, and FHE keypair
     InitNode {
         #[arg(short, long, default_value = "did:med:hospital:central-general")]
@@ -84,7 +87,14 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::InitNode { did, role } => {
+        None | Some(Commands::Gui) => {
+            println!("Launching MedCrypta Native Desktop GUI...");
+            if let Err(e) = medcrypta::gui::run_gui() {
+                eprintln!("[ERROR] Failed to start native GUI: {}", e);
+            }
+        }
+
+        Some(Commands::InitNode { did, role }) => {
             println!(
                 "{}",
                 "==========================================================".cyan()
@@ -125,14 +135,14 @@ fn main() {
             println!("\n[SUCCESS] Node cryptographic identity successfully initialized.");
         }
 
-        Commands::Encrypt {
+        Some(Commands::Encrypt {
             patient_id,
             age,
             hba1c,
             glucose,
             systolic,
             output,
-        } => {
+        }) => {
             let record = PatientRecord::mock_patient(&patient_id, age, hba1c, glucose, systolic);
             let engine = CKKSEngine::default();
             let (_sk, pk) = engine.keygen();
@@ -155,13 +165,13 @@ fn main() {
             }
         }
 
-        Commands::Prove {
+        Some(Commands::Prove {
             metric,
             value,
             threshold,
             upper_bound,
             output,
-        } => {
+        }) => {
             let blinding = 987654321;
             match ZKPEngine::prove_threshold(value, blinding, threshold, upper_bound) {
                 Ok(proof) => {
@@ -203,7 +213,7 @@ fn main() {
             }
         }
 
-        Commands::Verify { proof_file } => {
+        Some(Commands::Verify { proof_file }) => {
             let data = fs::read_to_string(&proof_file).expect("Failed to read proof file");
             let proof: medcrypta::zkp::ThresholdProof =
                 serde_json::from_str(&data).expect("Invalid proof format");
@@ -227,7 +237,7 @@ fn main() {
             }
         }
 
-        Commands::Shred { record_id } => {
+        Some(Commands::Shred { record_id }) => {
             let mut km = KeyManager::new();
             let envelope = km.encrypt(&record_id, b"Sensitive PHI payload");
             match km.shred_key(&envelope.key_id, &record_id) {
@@ -258,7 +268,7 @@ fn main() {
             }
         }
 
-        Commands::QuantumAudit => {
+        Some(Commands::QuantumAudit) => {
             let report = QuantumAuditor::evaluate_rlwe_security(128, 1_073_741_789, 3.2);
 
             let mut table = Table::new();
@@ -318,7 +328,7 @@ fn main() {
             }
         }
 
-        Commands::Demo => {
+        Some(Commands::Demo) => {
             run_interactive_demo();
         }
     }
