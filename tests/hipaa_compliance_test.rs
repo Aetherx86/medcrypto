@@ -1,5 +1,5 @@
-use medcrypta::compliance::AuditLedger;
-use medcrypta::zkp::ZKPEngine;
+use medcrypto::compliance::AuditLedger;
+use medcrypto::zkp::ZKPEngine;
 
 #[test]
 fn test_hipaa_minimum_necessary_zero_knowledge() {

@@ -6,7 +6,7 @@
 // 3. Jaccard & PR-AUC Evaluation Metrics
 // 4. Empirical validation of VITA (Top-1 relevant vs Bot-1 irrelevant noise)
 
-use medcrypta::clinical_ai::{
+use medcrypto::clinical_ai::{
     COGNetPredictor, ClinicalVisit, EvaluationMetrics, RelevantVisitSelector, TargetAwareAttention,
 };
 
@@ -152,7 +152,7 @@ fn test_vita_empirical_hypothesis_top1_beats_bot1() {
     let bot_1_jaccard = EvaluationMetrics::jaccard(&ground_truth, &bot_1_prescribed);
     let bot_1_pr_auc = EvaluationMetrics::pr_auc(&ground_truth, &bot_1_scores);
 
-    println!("VITA Empirical Validation in MedCrypta:");
+    println!("VITA Empirical Validation in MedCrypto:");
     println!(
         "  Top-1 Relevant Visit: Jaccard = {:.4}, PR-AUC = {:.4}",
         top_1_jaccard, top_1_pr_auc

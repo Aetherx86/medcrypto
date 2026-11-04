@@ -16,7 +16,7 @@ enum ActiveTab {
     QuantumAudit,
 }
 
-pub struct MedCryptaApp {
+pub struct MedCryptoApp {
     active_tab: ActiveTab,
 
     // Blockchain & DID State
@@ -63,7 +63,7 @@ pub struct MedCryptaApp {
     audit_ledger: AuditLedger,
 }
 
-impl Default for MedCryptaApp {
+impl Default for MedCryptoApp {
     fn default() -> Self {
         let mut blockchain = BlockchainConsentRegistry::new();
         blockchain.register_did(
@@ -145,13 +145,13 @@ impl Default for MedCryptaApp {
     }
 }
 
-impl eframe::App for MedCryptaApp {
+impl eframe::App for MedCryptoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Top Navigation Bar
         egui::TopBottomPanel::top("top_header").show(ctx, |ui| {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.heading("MedCrypta");
+                ui.heading("MedCrypto");
                 ui.label(" |  Native Privacy-Preserving Confidential Data Mesh (v0.0.1-beta)");
             });
             ui.add_space(6.0);
@@ -214,10 +214,10 @@ impl eframe::App for MedCryptaApp {
     }
 }
 
-impl MedCryptaApp {
+impl MedCryptoApp {
     fn render_overview(&mut self, ui: &mut egui::Ui) {
         ui.heading("Project Overview & System Status");
-        ui.label("MedCrypta provides mathematically guaranteed privacy-preserving data sharing between distrusting institutions.");
+        ui.label("MedCrypto provides mathematically guaranteed privacy-preserving data sharing between distrusting institutions.");
         ui.add_space(10.0);
 
         ui.group(|ui| {
@@ -630,13 +630,13 @@ pub fn run_gui() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 720.0])
             .with_min_inner_size([800.0, 600.0])
-            .with_title("MedCrypta: Privacy-Preserving Confidential Data Mesh"),
+            .with_title("MedCrypto: Privacy-Preserving Confidential Data Mesh"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "MedCrypta",
+        "MedCrypto",
         native_options,
-        Box::new(|_cc| Ok(Box::new(MedCryptaApp::default()))),
+        Box::new(|_cc| Ok(Box::new(MedCryptoApp::default()))),
     )
 }

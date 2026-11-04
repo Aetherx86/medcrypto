@@ -3,16 +3,16 @@ use colored::*;
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, Color, Table};
-use medcrypta::blockchain::{BlockchainConsentRegistry, EntityRole};
-use medcrypta::compliance::{AuditLedger, KeyManager};
-use medcrypta::fhe::CKKSEngine;
-use medcrypta::models::PatientRecord;
-use medcrypta::quantum::QuantumAuditor;
-use medcrypta::zkp::ZKPEngine;
+use medcrypto::blockchain::{BlockchainConsentRegistry, EntityRole};
+use medcrypto::compliance::{AuditLedger, KeyManager};
+use medcrypto::fhe::CKKSEngine;
+use medcrypto::models::PatientRecord;
+use medcrypto::quantum::QuantumAuditor;
+use medcrypto::zkp::ZKPEngine;
 use std::fs;
 
 #[derive(Parser)]
-#[command(name = "medcrypta")]
+#[command(name = "medcrypto")]
 #[command(author = "Jeong Hoon Kim")]
 #[command(version = "0.0.1-beta")]
 #[command(about = "Privacy-Preserving Cross-Institutional Healthcare Data Sharing Engine", long_about = None)]
@@ -88,8 +88,8 @@ fn main() {
 
     match cli.command {
         None | Some(Commands::Gui) => {
-            println!("Launching MedCrypta Native Desktop GUI...");
-            if let Err(e) = medcrypta::gui::run_gui() {
+            println!("Launching MedCrypto Native Desktop GUI...");
+            if let Err(e) = medcrypto::gui::run_gui() {
                 eprintln!("[ERROR] Failed to start native GUI: {}", e);
             }
         }
@@ -101,7 +101,7 @@ fn main() {
             );
             println!(
                 "{}",
-                "  MedCrypta: Initializing Healthcare Node Cryptography   "
+                "  MedCrypto: Initializing Healthcare Node Cryptography   "
                     .bold()
                     .cyan()
             );
@@ -215,7 +215,7 @@ fn main() {
 
         Some(Commands::Verify { proof_file }) => {
             let data = fs::read_to_string(&proof_file).expect("Failed to read proof file");
-            let proof: medcrypta::zkp::ThresholdProof =
+            let proof: medcrypto::zkp::ThresholdProof =
                 serde_json::from_str(&data).expect("Invalid proof format");
 
             let valid = ZKPEngine::verify_threshold(&proof);

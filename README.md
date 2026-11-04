@@ -1,8 +1,8 @@
-# MedCrypta (v0.0.1-beta)
+# MedCrypto (v0.0.1-beta)
 
 Privacy-Preserving Cross-Institutional Healthcare Data Sharing Engine.
 
-MedCrypta is a high-performance cryptographic engine and command-line toolkit built in Rust. It enables hospitals, healthcare institutions, and research centers to collaboratively share and compute on sensitive patient records (PHI) without violating strict global data privacy regulations, including GDPR (Articles 9, 17, and 25) and HIPAA (Privacy Rule, Minimum Necessary Standard, and Security Rule).
+MedCrypto is a high-performance cryptographic engine and command-line toolkit built in Rust. It enables hospitals, healthcare institutions, and research centers to collaboratively share and compute on sensitive patient records (PHI) without violating strict global data privacy regulations, including GDPR (Articles 9, 17, and 25) and HIPAA (Privacy Rule, Minimum Necessary Standard, and Security Rule).
 
 The system integrates four complementary technologies:
 1. Consortium Blockchain Layer: W3C Decentralized Identity (DID), Dynamic Patient Consent Smart Contracts, and Zero-PHI State Commitments.
@@ -14,7 +14,7 @@ The system integrates four complementary technologies:
 
 ## 1. Regulatory Compliance Architecture
 
-| Regulation & Clause | Legal Requirement | Technical Conflict | MedCrypta Implementation & Guarantee |
+| Regulation & Clause | Legal Requirement | Technical Conflict | MedCrypto Implementation & Guarantee |
 | :--- | :--- | :--- | :--- |
 | GDPR Article 17 | Right to Erasure (Forgotten) | Blockchain immutability prevents deleting on-chain records | Ephemeral Key Envelope Shredding: Raw PHI is encrypted under an ephemeral key. Blockchain stores only cryptographic commitments and one-time key identifiers. When consent is revoked, the key is permanently zeroized in memory and KMS, rendering ciphertexts mathematically undecryptable without modifying ledger history. |
 | GDPR Article 25 | Privacy by Design | Exposure of patient records during processing | In-hospital encryption boundary: Clinical records are converted into CKKS ciphertexts and ZKP commitments before leaving the hospital intranet. No plaintext crosses organizational perimeters. |
@@ -25,7 +25,7 @@ The system integrates four complementary technologies:
 
 ## 2. Post-Quantum Cryptography (PQC) Security Analysis
 
-MedCrypta evaluates and implements quantum-resilient cryptographic foundations to resist emerging quantum threats (Shor's and Grover's algorithms):
+MedCrypto evaluates and implements quantum-resilient cryptographic foundations to resist emerging quantum threats (Shor's and Grover's algorithms):
 
 - Lattice-Based Homomorphic Encryption:
   - Scheme: 4th Generation CKKS over cyclotomic polynomial rings R_q = Z_q[X] / (X^N + 1).
@@ -43,10 +43,10 @@ MedCrypta evaluates and implements quantum-resilient cryptographic foundations t
 
 ## 3. Clinical AI Longitudinal Recommender Engine (VITA & COGNet)
 
-MedCrypta unifies privacy compliance (HIPAA Minimum Necessary & GDPR Data Minimization) with state-of-the-art clinical deep learning on longitudinal electronic health records (MIMIC-III benchmark, GAMENet, LEAP, SafeDrug, COGNet):
+MedCrypto unifies privacy compliance (HIPAA Minimum Necessary & GDPR Data Minimization) with state-of-the-art clinical deep learning on longitudinal electronic health records (MIMIC-III benchmark, GAMENet, LEAP, SafeDrug, COGNet):
 
 1. Component 1: Relevant Past Visit Selection & Target-Aware Attention (VITA, AAAI 2024):
-   - Rather than unconditionally concatenating all historical encounters (which injects clinical noise and violates data minimization), MedCrypta ranks past visits by cosine similarity to the current encounter.
+   - Rather than unconditionally concatenating all historical encounters (which injects clinical noise and violates data minimization), MedCrypto ranks past visits by cosine similarity to the current encounter.
    - Empirical validation: Selecting the Top-1 clinically relevant visit achieves superior Jaccard similarity and PR-AUC, whereas incorporating irrelevant past visits (Bot-1) degrades representation below the baseline.
 2. Component 2: COGNet-Inspired Copy-or-Generate Predictor:
    - Evaluates multi-label medication regimens by balancing a Copy mechanism (repeating maintenance drugs from pertinent past visits) and a Generate mechanism (acute prescriptions derived from current diagnoses).
@@ -68,11 +68,11 @@ MedCrypta unifies privacy compliance (HIPAA Minimum Necessary & GDPR Data Minimi
 Clone the repository and compile the release binary:
 
 ```bash
-cd medcrypta
+cd medcrypto
 cargo build --release
 ```
 
-The optimized binary will be produced at `target/release/medcrypta`.
+The optimized binary will be produced at `target/release/medcrypto`.
 
 ---
 
@@ -107,25 +107,25 @@ cargo test --all --verbose
 ## 6. Command-Line Interface (CLI) & Native GUI Usage
 
 ### 5.1 Launch Native Desktop Graphical User Interface (GUI)
-MedCrypta features a high-performance native desktop GUI built with `egui` and `eframe` (no HTML/Electron/WebView). It provides interactive visual dashboards for EMR ingestion, real-time CKKS polynomial encryption, ZKP proof generation and verification, multi-hospital federated computing, GDPR cryptographic shredding, and post-quantum parameter inspection:
+MedCrypto features a high-performance native desktop GUI built with `egui` and `eframe` (no HTML/Electron/WebView). It provides interactive visual dashboards for EMR ingestion, real-time CKKS polynomial encryption, ZKP proof generation and verification, multi-hospital federated computing, GDPR cryptographic shredding, and post-quantum parameter inspection:
 
 ```bash
-./target/release/medcrypta gui
+./target/release/medcrypto gui
 # Or simply run without arguments:
-./target/release/medcrypta
+./target/release/medcrypto
 ```
 
 ### 5.2 Initialize Hospital Node Cryptography
 Generates node identity, W3C DID document, and 4th Gen CKKS public/private keypairs:
 
 ```bash
-./target/release/medcrypta init-node --did did:med:hospital:severance --role HospitalNode
+./target/release/medcrypto init-node --did did:med:hospital:severance --role HospitalNode
 ```
 
 Example Output:
 ```text
 ==========================================================
-  MedCrypta: Initializing Healthcare Node Cryptography   
+  MedCrypto: Initializing Healthcare Node Cryptography   
 ==========================================================
 Node DID:         did:med:hospital:severance
 Role:             HospitalNode
@@ -140,7 +140,7 @@ Public Key Hash:  0x000000003e165c4e
 Converts patient clinical vitals (Age, Systolic BP, Diastolic BP, Glucose, HbA1c, BMI, eGFR, LDL) into an encrypted CKKS vector:
 
 ```bash
-./target/release/medcrypta encrypt \
+./target/release/medcrypto encrypt \
   --patient-id P-8001 \
   --age 52.0 \
   --hba1c 5.8 \
@@ -158,7 +158,7 @@ Example Output:
 Generates a non-interactive zero-knowledge proof that a patient's HbA1c is below the diabetic threshold (<= 6.5%) without disclosing their actual measurement (e.g., 5.8%):
 
 ```bash
-./target/release/medcrypta prove \
+./target/release/medcrypto prove \
   --metric hba1c \
   --value 58 \
   --threshold 65 \
@@ -183,7 +183,7 @@ Proof saved to ./zkp_hba1c_proof.json
 An external hospital or research institution verifies the proof mathematically without access to patient records:
 
 ```bash
-./target/release/medcrypta verify --proof-file ./zkp_hba1c_proof.json
+./target/release/medcrypto verify --proof-file ./zkp_hba1c_proof.json
 ```
 
 Example Output:
@@ -196,7 +196,7 @@ The claimed condition is satisfied without revealing underlying clinical data.
 Irrevocably destroys the ephemeral key envelope for a specified record upon patient consent withdrawal:
 
 ```bash
-./target/release/medcrypta shred --record-id P-8001
+./target/release/medcrypto shred --record-id P-8001
 ```
 
 Example Output:
@@ -218,27 +218,27 @@ The associated ciphertext on storage/blockchain is now mathematically unrecovera
 Displays security assessment table and quantum parameter validations:
 
 ```bash
-./target/release/medcrypta quantum-audit
+./target/release/medcrypto quantum-audit
 ```
 
 ### 6.7 Run Full Multi-Institutional Interactive Simulation
 Simulates the entire multi-hospital lifecycle (DID registration, dynamic consent, ZKP screening, FHE federated average, audit trail, and crypto-shredding):
 
 ```bash
-./target/release/medcrypta demo
+./target/release/medcrypto demo
 ```
 
 ---
 
 ## 7. Rust Library Integration Example
 
-MedCrypta can be embedded directly into existing hospital health information systems (HIS / EMR):
+MedCrypto can be embedded directly into existing hospital health information systems (HIS / EMR):
 
 ```rust
-use medcrypta::fhe::CKKSEngine;
-use medcrypta::zkp::ZKPEngine;
-use medcrypta::models::PatientRecord;
-use medcrypta::compliance::KeyManager;
+use medcrypto::fhe::CKKSEngine;
+use medcrypto::zkp::ZKPEngine;
+use medcrypto::models::PatientRecord;
+use medcrypto::compliance::KeyManager;
 
 fn main() {
     // 1. Initialize CKKS Homomorphic Encryption Engine

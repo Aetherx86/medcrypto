@@ -1,4 +1,4 @@
-use medcrypta::fhe::CKKSEngine;
+use medcrypto::fhe::CKKSEngine;
 
 #[test]
 fn test_ckks_vector_multi_slot_accuracy() {

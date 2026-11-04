@@ -1,4 +1,4 @@
-use medcrypta::quantum::QuantumAuditor;
+use medcrypto::quantum::QuantumAuditor;
 
 #[test]
 fn test_post_quantum_lattice_parameters() {

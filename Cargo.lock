@@ -2015,7 +2015,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "medcrypta"
+name = "medcrypto"
 version = "0.0.1-beta"
 dependencies = [
  "aes-gcm",

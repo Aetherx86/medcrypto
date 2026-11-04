@@ -1,5 +1,5 @@
 [package]
-name = "medcrypta"
+name = "medcrypto"
 version = "0.0.1-beta"
 edition = "2021"
 authors = ["Jeong Hoon Kim"]

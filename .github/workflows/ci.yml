@@ -58,13 +58,13 @@ jobs:
         run: cargo build --release
 
       - name: Verify CLI Binary & Run Demo
-        run: ./target/release/medcrypta demo
+        run: ./target/release/medcrypto demo
 
       - name: Verify Post-Quantum Cryptography Audit
-        run: ./target/release/medcrypta quantum-audit
+        run: ./target/release/medcrypto quantum-audit
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: medcrypta-${{ matrix.os }}-v0.0.1-beta
-          path: target/release/medcrypta
+          name: medcrypto-${{ matrix.os }}-v0.0.1-beta
+          path: target/release/medcrypto

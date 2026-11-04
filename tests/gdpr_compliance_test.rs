@@ -1,5 +1,5 @@
-use medcrypta::blockchain::BlockchainConsentRegistry;
-use medcrypta::compliance::KeyManager;
+use medcrypto::blockchain::BlockchainConsentRegistry;
+use medcrypto::compliance::KeyManager;
 
 #[test]
 fn test_gdpr_article_17_cryptographic_shredding() {
