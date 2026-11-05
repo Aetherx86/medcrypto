@@ -1,0 +1,5 @@
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0194", # quick-xml quadratic run time in eframe/accesskit transitives
+    "RUSTSEC-2026-0195", # quick-xml unbounded namespace allocation in eframe/accesskit transitives
+]
