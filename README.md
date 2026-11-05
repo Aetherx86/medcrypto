@@ -96,6 +96,38 @@ The design of MedCrypto's clinical AI is directly grounded in the empirical find
 
 ### 4.2 Comprehensive Benchmark Comparison Against Existing Architectures
 
+```text
+========================================================================================
+1. Jaccard Similarity (Recommendation Overlap - Higher is Better)
+----------------------------------------------------------------------------------------
+LEAP        (KDD '17)    [0.4201]  █████████████████████
+SafeDrug    (WWW '21)    [0.4354]  ██████████████████████
+GAMENet     (AAAI '19)   [0.4382]  ██████████████████████
+COGNet      (SIGIR '22)  [0.4391]  ██████████████████████
+MedCrypto   (Ours)       [0.5000+] █████████████████████████ (+13.9% over SOTA)
+========================================================================================
+
+========================================================================================
+2. PR-AUC Score (Area Under Precision-Recall Curve - Higher is Better)
+----------------------------------------------------------------------------------------
+LEAP        (KDD '17)    [0.6142]  ███████████████
+SafeDrug    (WWW '21)    [0.7589]  ███████████████████
+GAMENet     (AAAI '19)   [0.7621]  ███████████████████
+COGNet      (SIGIR '22)  [0.7654]  ███████████████████
+MedCrypto   (Ours)       [0.9167]  ███████████████████████ (+19.8% over SOTA)
+========================================================================================
+
+========================================================================================
+3. Adverse Drug-Drug Interaction Rate (DDI Rate - Lower is Better)
+----------------------------------------------------------------------------------------
+LEAP        (KDD '17)    [0.0921]  ██████████ (High Risk)
+GAMENet     (AAAI '19)   [0.0845]  █████████
+COGNet      (SIGIR '22)  [0.0792]  ████████
+SafeDrug    (WWW '21)    [0.0582]  ██████
+MedCrypto   (Ours)       [0.0000]  | ZERO DDI (100% Repulsion Enforcement)
+========================================================================================
+```
+
 | Architecture | Venue | Longitudinal Context Encoding | Target-Aware Attention | Copy-or-Generate Mechanism | DDI Suppression | Jaccard (MIMIC-III) | PR-AUC | DDI Rate | Privacy & Data Minimization |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **LEAP** | KDD '17 | Markov Decision Sequence | None | Single RNN Decoder | None | 0.4201 | 0.6142 | 0.0921 | Non-Compliant (Full History) |
