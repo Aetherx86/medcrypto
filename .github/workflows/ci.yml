@@ -41,12 +41,17 @@ jobs:
           echo "Repository hygiene check completed successfully."
 
   # ===========================================================================
-  # 2. Rust Quality & Security Workflow
+  # 2. Rust Quality & Test Matrix
   # ===========================================================================
   rust-workflow:
-    name: Rust Quality, Tests & Security Audit
-    runs-on: ubuntu-latest
+    name: Rust Quality & Test Matrix (${{ matrix.os }})
+    needs: [security-audit]
+    runs-on: ${{ matrix.os }}
     if: hashFiles('**/Cargo.toml') != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -81,7 +86,7 @@ jobs:
       - name: Rust Tests (cargo test)
         run: |
           if [ -f "Cargo.toml" ]; then
-            cargo test --workspace --all-targets --all-features
+            cargo test --workspace --all-targets --all-features -- --nocapture
           else
             find . -name "Cargo.toml" -not -path "*/target/*" -execdir cargo test --all-targets --all-features \;
           fi
@@ -92,6 +97,12 @@ jobs:
             cargo audit
           else
             find . -name "Cargo.toml" -not -path "*/target/*" -execdir cargo audit \;
+          fi
+
+      - name: Strict Documentation Build (cargo doc)
+        run: |
+          if [ -f "Cargo.toml" ]; then
+            RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
           fi
 
   # ===========================================================================

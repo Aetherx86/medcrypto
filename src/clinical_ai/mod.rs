@@ -75,7 +75,7 @@ impl GumbelVisitSelector {
     }
 
     /// Computes pairwise context logits s_t = MLP([v_t || v_T]) in R^2
-    /// s_t[0] = discard logit, s_t[1] = retain logit
+    /// `s_t[0] = discard logit, s_t[1] = retain logit`
     pub fn compute_selection_logits(
         current_visit: &ClinicalVisit,
         past_visit: &ClinicalVisit,

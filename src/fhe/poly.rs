@@ -119,7 +119,7 @@ impl Polynomial {
         Polynomial::new(coeffs, q)
     }
 
-    /// Polynomial multiplication in R_q = Z_q[X] / (X^N + 1) using negacyclic convolution
+    /// Polynomial multiplication in `R_q = Z_q[X] / (X^N + 1)` using negacyclic convolution
     pub fn mul_negacyclic(&self, other: &Polynomial) -> Self {
         let n = self.degree();
         assert_eq!(n, other.degree());

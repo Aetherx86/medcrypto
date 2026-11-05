@@ -1,0 +1,28 @@
+# Copyright (c) 2026 Jeong Hoon Kim. All rights reserved.
+name: Security Audit
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  schedule:
+    - cron: "0 0 * * 1" # Weekly every Monday at 00:00 UTC
+  workflow_dispatch:
+
+jobs:
+  audit:
+    name: Dependency Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit

@@ -85,8 +85,7 @@ fn main() {
 
     // 1. Top-1 Relevant Visit (VITA Target-Aware Attention)
     let top1_visits = RelevantVisitSelector::select_top_k(&current_visit, &past_visits, 1);
-    let (top1_preds, top1_probs) =
-        predictor.autoregressive_decode(&current_visit, &top1_visits, 6);
+    let (top1_preds, top1_probs) = predictor.autoregressive_decode(&current_visit, &top1_visits, 6);
     let top1_jaccard = EvaluationMetrics::jaccard(&ground_truth, &top1_preds);
     let top1_prauc = EvaluationMetrics::pr_auc(&ground_truth, &top1_probs);
     let top1_f1 = EvaluationMetrics::f1(&ground_truth, &top1_preds);
@@ -111,8 +110,7 @@ fn main() {
     // 4. Bot-1 Irrelevant Visit (Orthopedic Noise Distraction)
     let ranked = RelevantVisitSelector::rank_visits(&current_visit, &past_visits);
     let bot1_visits: Vec<&ClinicalVisit> = ranked.last().map(|(v, _)| vec![*v]).unwrap_or_default();
-    let (bot1_preds, bot1_probs) =
-        predictor.autoregressive_decode(&current_visit, &bot1_visits, 6);
+    let (bot1_preds, bot1_probs) = predictor.autoregressive_decode(&current_visit, &bot1_visits, 6);
     let bot1_jaccard = EvaluationMetrics::jaccard(&ground_truth, &bot1_preds);
     let bot1_prauc = EvaluationMetrics::pr_auc(&ground_truth, &bot1_probs);
     let bot1_f1 = EvaluationMetrics::f1(&ground_truth, &bot1_preds);
@@ -178,10 +176,22 @@ fn main() {
     println!("==========================================================");
     println!("  Empirical Takeaways (VITA, AAAI 2024 Validation):       ");
     println!("==========================================================");
-    println!("1. PQ1 Confirmed: Incorporating longitudinal history (All Jaccard: {:.4})", all_jaccard);
-    println!("   significantly outperforms static snapshots (No Jaccard: {:.4}).", no_jaccard);
-    println!("2. PQ2 Confirmed: Selective Top-1 extraction (Jaccard: {:.4}) matches or", top1_jaccard);
-    println!("   exceeds All visits, while irrelevant Bot-1 noise (Jaccard: {:.4}) drops", bot1_jaccard);
+    println!(
+        "1. PQ1 Confirmed: Incorporating longitudinal history (All Jaccard: {:.4})",
+        all_jaccard
+    );
+    println!(
+        "   significantly outperforms static snapshots (No Jaccard: {:.4}).",
+        no_jaccard
+    );
+    println!(
+        "2. PQ2 Confirmed: Selective Top-1 extraction (Jaccard: {:.4}) matches or",
+        top1_jaccard
+    );
+    println!(
+        "   exceeds All visits, while irrelevant Bot-1 noise (Jaccard: {:.4}) drops",
+        bot1_jaccard
+    );
     println!("   below the zero-history baseline!");
     println!("3. Privacy Regulatory Guarantee: Selective visit extraction simultaneously");
     println!("   fulfills HIPAA Minimum Necessary §164.502(b) and GDPR Art. 5(1)(c)");
