@@ -41,7 +41,25 @@ MedCrypto evaluates and implements quantum-resilient cryptographic foundations t
 
 ---
 
-## 3. Clinical AI Longitudinal Recommender Engine (VITA & COGNet)
+## 3. Architectural Separation: MedCrypto vs. zkHyperVM
+
+MedCrypto and **zkHyperVM** are **two fundamentally separate tools** designed for distinct functional domains, computational boundaries, and cryptographic threat models:
+
+| Architectural Vector | **MedCrypto (`medcrypto`)** | **zkHyperVM (zkVM / SP1)** |
+| :--- | :--- | :--- |
+| **Primary Domain** | **Healthcare Data Sharing & Privacy Mesh** (HIPAA / GDPR regulatory compliance) | **General-Purpose Zero-Knowledge Computing** (Arbitrary verifiable execution) |
+| **Core Cryptography** | **4th Gen CKKS Homomorphic Encryption (Ring-LWE)** + Ephemeral Envelope Shredding | **RISC-V STARKs, AIR polynomial arithmetic, FRI, and Groth16 recursion** |
+| **Target Workload** | Cross-hospital federated statistical analytics (averaging HbA1c, glucose, vitals without decryption) and Longitudinal Clinical AI (VITA & COGNet) | Verifiable CPU state transitions, smart contract invariants, and arbitrary program proving |
+| **Deployment Runtime** | Native daemon, CLI, and GUI service deployed directly on hospital infrastructure (Linux, macOS, Unix) | Sandboxed virtual execution trace coprocessor running isolated guest ELF binaries |
+
+### Synergistic Integration Interface (Verifiable FHE & STARK Upgrades)
+While MedCrypto operates as an independent, self-contained privacy mesh, it interfaces synergistically with zkHyperVM:
+1. **Plug-in ZK Coprocessor**: While MedCrypto uses lightweight embedded Pedersen NIZKs for standard single-variable clinical predicates, zkHyperVM can be linked as an optional post-quantum ZK coprocessor to prove complex multi-variable diagnostic logic and high-dimensional clinical trial eligibility.
+2. **Verifiable FHE Paradigm**: MedCrypto computes federated aggregations over encrypted vector ciphertexts, while zkHyperVM can prove that the host hospital executed the aggregation algorithm faithfully without tampering with algorithmic inputs.
+
+---
+
+## 4. Clinical AI Longitudinal Recommender Engine (VITA & COGNet)
 
 MedCrypto unifies privacy compliance (HIPAA Minimum Necessary & GDPR Data Minimization) with state-of-the-art clinical deep learning on longitudinal electronic health records (MIMIC-III benchmark, GAMENet, LEAP, SafeDrug, COGNet):
 
@@ -57,7 +75,7 @@ MedCrypto unifies privacy compliance (HIPAA Minimum Necessary & GDPR Data Minimi
 
 ---
 
-## 4. Installation and Build
+## 5. Installation and Build
 
 ### Prerequisites
 - Rust toolchain: stable (1.80+ recommended, tested on Rust 1.99+)
@@ -76,7 +94,7 @@ The optimized binary will be produced at `target/release/medcrypto`.
 
 ---
 
-## 5. Test Suite Execution
+## 6. Test Suite Execution
 
 The test suite validates both mathematical correctness, regulatory compliance invariants, and clinical AI accuracy:
 
@@ -104,7 +122,7 @@ cargo test --all --verbose
 
 ---
 
-## 6. Command-Line Interface (CLI), GUI & Examples
+## 7. Command-Line Interface (CLI), GUI & Examples
 
 ### 6.1 Launch Native Desktop Graphical User Interface (GUI)
 MedCrypto features a high-performance native desktop GUI built with `egui` and `eframe` (no HTML/Electron/WebView). It provides 7 interactive visual dashboards:
@@ -248,7 +266,7 @@ Simulates the entire multi-hospital lifecycle (DID registration, dynamic consent
 
 ---
 
-## 7. Rust Library Integration Example
+## 8. Rust Library Integration Example
 
 MedCrypto can be embedded directly into existing hospital health information systems (HIS / EMR):
 
@@ -289,7 +307,7 @@ fn main() {
 
 ---
 
-## 8. Continuous Integration Workflow
+## 9. Continuous Integration Workflow
 
 The package includes a comprehensive GitHub Actions workflow configured at `.github/workflows/ci.yml`.
 
@@ -302,12 +320,12 @@ The pipeline executes on every push and pull request to `main` and `master` bran
 
 ---
 
-## 9. Author
+## 10. Author
 
 Jeong Hoon Kim
 
 ---
 
-## 10. License
+## 11. License
 
 MIT License. See the [LICENSE](LICENSE) file for details.
