@@ -4,6 +4,12 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use ed25519_compact::{KeyPair, PublicKey, SecretKey, Seed, Signature};
 use hkdf::Hkdf;
+use medcrypto_fhe::{
+    from_bytes, to_bytes, CKKSEngine, Ciphertext, CkksPreset, FheError, PublicKey as FhePublicKey,
+    SecretKey as FheSecretKey,
+};
+use rand_chacha::ChaCha20Rng;
+use rand_core::SeedableRng;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -148,4 +154,129 @@ pub fn audit_link(previous: &[u8], entry: &[u8]) -> Vec<u8> {
 
 pub fn constant_time_equal(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
+}
+
+/// What a homomorphic operation can report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FheOpError {
+    BadEntropy,
+    BadEncoding,
+    ParameterMismatch,
+    ValueOutOfRange,
+    ScaleMismatch,
+    OutOfLevels,
+}
+
+/// A ciphertext as the interface passes it around. `data` is what counts: the other two are for convenience,
+/// and have to agree with it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FheCiphertext {
+    pub data: Vec<u8>,
+    pub degree: u32,
+    pub scale: f64,
+}
+
+impl From<FheError> for FheOpError {
+    fn from(e: FheError) -> Self {
+        match e {
+            FheError::ParameterMismatch => Self::ParameterMismatch,
+            FheError::TooManyValues { .. } | FheError::ValueOutOfRange(_) => Self::ValueOutOfRange,
+            FheError::ScaleMismatch { .. } => Self::ScaleMismatch,
+            FheError::OutOfLevels | FheError::ScaleOverflow => Self::OutOfLevels,
+            _ => Self::BadEncoding,
+        }
+    }
+}
+
+/// A generator from the caller's entropy, under a domain label so that one use cannot repeat another's stream.
+fn entropy_rng(entropy: &[u8], label: &[u8]) -> Result<ChaCha20Rng, FheOpError> {
+    if entropy.len() != 32 || entropy.iter().all(|&b| b == 0) {
+        return Err(FheOpError::BadEntropy);
+    }
+    let seed: [u8; 32] = Sha256::new()
+        .chain_update(b"medcrypto-component-fhe-v1")
+        .chain_update(label)
+        .chain_update(entropy)
+        .finalize()
+        .into();
+    Ok(ChaCha20Rng::from_seed(seed))
+}
+
+fn engine_for(param_id: u64) -> Result<CKKSEngine, FheOpError> {
+    [CkksPreset::N8192, CkksPreset::N16384]
+        .into_iter()
+        .map(CKKSEngine::from_preset)
+        .find(|e| e.context().param_id() == param_id)
+        .ok_or(FheOpError::ParameterMismatch)
+}
+
+fn parse_ciphertext(input: &FheCiphertext) -> Result<(CKKSEngine, Ciphertext), FheOpError> {
+    let ct: Ciphertext = from_bytes(&input.data).map_err(|_| FheOpError::BadEncoding)?;
+    let engine = engine_for(ct.param_id)?;
+    engine
+        .validate_ciphertext(&ct)
+        .map_err(|_| FheOpError::BadEncoding)?;
+    if ct.degree() as u32 != input.degree || ct.scale != input.scale {
+        return Err(FheOpError::BadEncoding);
+    }
+    Ok((engine, ct))
+}
+
+fn package_ciphertext(ct: &Ciphertext) -> Result<FheCiphertext, FheOpError> {
+    Ok(FheCiphertext {
+        data: to_bytes(ct).map_err(|_| FheOpError::BadEncoding)?,
+        degree: ct.degree() as u32,
+        scale: ct.scale,
+    })
+}
+
+/// Returns the public key and the secret key, at N = 8192.
+pub fn fhe_keygen(entropy: &[u8]) -> Result<(Vec<u8>, Vec<u8>), FheOpError> {
+    let mut rng = entropy_rng(entropy, b"keygen")?;
+    let (secret, public) = CKKSEngine::from_preset(CkksPreset::N8192).keygen_with(&mut rng);
+    Ok((
+        to_bytes(&public).map_err(|_| FheOpError::BadEncoding)?,
+        to_bytes(&secret).map_err(|_| FheOpError::BadEncoding)?,
+    ))
+}
+
+pub fn fhe_encrypt(
+    public_key: &[u8],
+    values: &[f64],
+    entropy: &[u8],
+) -> Result<FheCiphertext, FheOpError> {
+    let mut rng = entropy_rng(entropy, b"encrypt")?;
+    let public: FhePublicKey = from_bytes(public_key).map_err(|_| FheOpError::BadEncoding)?;
+    let engine = engine_for(public.param_id)?;
+    engine
+        .validate_public_key(&public)
+        .map_err(|_| FheOpError::BadEncoding)?;
+    package_ciphertext(&engine.encrypt_with(&public, values, &mut rng)?)
+}
+
+pub fn fhe_decrypt(secret_key: &[u8], ciphertext: &FheCiphertext) -> Result<Vec<f64>, FheOpError> {
+    let secret: FheSecretKey = from_bytes(secret_key).map_err(|_| FheOpError::BadEncoding)?;
+    let (engine, ct) = parse_ciphertext(ciphertext)?;
+    engine.validate_secret_key(&secret).map_err(|e| match e {
+        FheError::ParameterMismatch => FheOpError::ParameterMismatch,
+        _ => FheOpError::BadEncoding,
+    })?;
+    Ok(engine.decrypt(&secret, &ct)?)
+}
+
+pub fn fhe_add(a: &FheCiphertext, b: &FheCiphertext) -> Result<FheCiphertext, FheOpError> {
+    let (engine, x) = parse_ciphertext(a)?;
+    let (_, y) = parse_ciphertext(b)?;
+    if x.param_id != y.param_id {
+        return Err(FheOpError::ParameterMismatch);
+    }
+    if x.level() != y.level() {
+        return Err(FheOpError::ScaleMismatch);
+    }
+    package_ciphertext(&engine.add(&x, &y)?)
+}
+
+pub fn fhe_scalar_mul(a: &FheCiphertext, scalar: f64) -> Result<FheCiphertext, FheOpError> {
+    let (engine, x) = parse_ciphertext(a)?;
+    package_ciphertext(&engine.scalar_mul(&x, scalar)?)
 }

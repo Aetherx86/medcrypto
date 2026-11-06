@@ -1,4 +1,4 @@
-package medcrypto:crypto@0.1.0;
+package medcrypto:crypto@0.2.0;
 
 /// Cryptography with no ambient authority. This component imports nothing, so it cannot read a clock, a
 /// file, a socket or a random source. Anything that needs randomness takes it from the caller.
@@ -52,6 +52,54 @@ interface api {
     constant-time-equal: func(a: list<u8>, b: list<u8>) -> bool;
 }
 
+/// RNS-CKKS homomorphic encryption on real-valued vectors, at N = 8192 with 128 bits of post-quantum
+/// security by the Homomorphic Encryption Standard. Keys and ciphertext data are opaque bytes.
+interface fhe-ops {
+    enum fhe-error {
+        /// Entropy that is not 32 bytes, or is all zeros.
+        bad-entropy,
+        /// Bytes that do not decode to a valid key or ciphertext.
+        bad-encoding,
+        /// A key and a ciphertext from different parameter sets.
+        parameter-mismatch,
+        /// Not finite, too many values, or too large to fit.
+        value-out-of-range,
+        /// Two ciphertexts at different scales or levels, whose sum would be wrong.
+        scale-mismatch,
+        /// A fractional scalar on a ciphertext with no level left to pay for it.
+        out-of-levels,
+    }
+
+    record fhe-keypair {
+        public-key: list<u8>,
+        secret-key: list<u8>,
+    }
+
+    record ciphertext {
+        data: list<u8>,
+        /// 1 for a normal ciphertext.
+        degree: u32,
+        scale: f64,
+    }
+
+    /// A key pair from 32 bytes that have to come from a cryptographic random source.
+    keygen: func(entropy: list<u8>) -> result<fhe-keypair, fhe-error>;
+
+    /// Encrypts up to 4096 values. This component has no random source of its own, so the caller passes 32
+    /// fresh bytes from a cryptographic one, and must never reuse them.
+    encrypt-vector: func(pk: list<u8>, values: list<f64>, entropy: list<u8>) -> result<ciphertext, fhe-error>;
+
+    /// The values back, to about five decimal places when they are in the low hundreds.
+    decrypt-vector: func(sk: list<u8>, a: ciphertext) -> result<list<f64>, fhe-error>;
+
+    /// Enc(x) + Enc(y) = Enc(x + y), slot by slot.
+    homomorphic-add: func(a: ciphertext, b: ciphertext) -> result<ciphertext, fhe-error>;
+
+    /// Enc(x) * k = Enc(k * x). A whole number costs nothing, and a fraction uses up one of two levels.
+    homomorphic-scalar-mul: func(a: ciphertext, scalar: f64) -> result<ciphertext, fhe-error>;
+}
+
 world medcrypto {
     export api;
+    export fhe-ops;
 }

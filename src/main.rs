@@ -1,26 +1,84 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use colored::*;
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, Color, Table};
 use medcrypto::blockchain::{BlockchainConsentRegistry, EntityRole};
 use medcrypto::compliance::{AuditLedger, KeyManager};
-use medcrypto::fhe::CKKSEngine;
+use medcrypto::consortium::{
+    bootstrap_consortium, query_status, run_daemon, BootstrapNode, NodeConfig,
+};
+use medcrypto::fhe::{
+    to_bytes, CKKSEngine, Ciphertext, CkksPreset, GaloisKey, PublicKey, SecretKey,
+};
+use medcrypto::fhir::client::{fetch_observations, ClientOptions};
+use medcrypto::fhir::pipeline::Row;
+use medcrypto::fhir::{
+    build_table, parse_bundle, CohortTable, Imputation, ParsedBundle, PipelineOptions,
+    Winsorization,
+};
 use medcrypto::models::PatientRecord;
+use medcrypto::packing::vertical::AnalyteStatistics;
+use medcrypto::packing::{CohortFile, RecordEnvelope};
 use medcrypto::quantum::QuantumAuditor;
-use medcrypto::zkp::ZKPEngine;
+use medcrypto::zkp::{
+    backend_for_profile, Profile, StarkCoprocessorBackend, ThresholdProof, ZKPEngine,
+};
+use rand::RngCore;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 mod license;
 
 #[derive(Parser)]
 #[command(name = "medcrypto")]
 #[command(author = "Jeong Hoon Kim")]
-#[command(version = "0.0.1-beta")]
-#[command(about = "Privacy-Preserving Cross-Institutional Healthcare Data Sharing Engine", long_about = None)]
+#[command(version)]
+#[command(about = "Privacy-preserving healthcare data sharing: RNS-CKKS, threshold decryption, range proofs, FHIR ingestion and a consortium daemon", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PackMode {
+    /// One ciphertext per patient, each under a key of its own that can be destroyed
+    Horizontal,
+    /// One ciphertext per analyte, for statistics over the whole cohort
+    Vertical,
+    /// No encryption: the cleaned table that a consortium daemon takes as input. It holds patient data
+    Table,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum WinsorizeArg {
+    Off,
+    /// Clamp to the catalog's clinical limits
+    Clinical,
+    /// Clamp to the cohort's 1st and 99th percentiles
+    P1p99,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ImputeArg {
+    /// Leave results missing, so that statistics exclude them
+    None,
+    Median,
+    Mean,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BackendArg {
+    /// The fast range proof, which is not post-quantum
+    Pedersen,
+    /// An external post-quantum prover
+    Stark,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ProfileArg {
+    Development,
+    Production,
 }
 
 #[derive(Subcommand)]
@@ -28,7 +86,7 @@ enum Commands {
     /// Launch the native desktop graphical user interface (GUI)
     Gui,
 
-    /// Initialize a new hospital node identity, DID, and FHE keypair
+    /// Show a hospital node's DID and encryption parameters
     InitNode {
         #[arg(short, long, default_value = "did:med:hospital:central-general")]
         did: String,
@@ -36,7 +94,16 @@ enum Commands {
         role: String,
     },
 
-    /// Encrypt a patient record using 4th Generation Homomorphic Encryption (CKKS)
+    /// Generate a secret key, public key, rotation keys and relinearization key
+    Keygen {
+        #[arg(short, long)]
+        output_dir: PathBuf,
+        /// Ring degree: 8192 or 16384
+        #[arg(long, default_value_t = 8192)]
+        poly_degree: usize,
+    },
+
+    /// Encrypt one patient's vitals into a CKKS ciphertext
     Encrypt {
         #[arg(short, long, default_value = "P-10023")]
         patient_id: String,
@@ -48,11 +115,98 @@ enum Commands {
         glucose: f64,
         #[arg(long, default_value_t = 128.0)]
         systolic: f64,
+        /// A public key file. Without one, a new key set is written next to the output
+        #[arg(long)]
+        public_key: Option<PathBuf>,
         #[arg(short, long)]
-        output: Option<String>,
+        output: Option<PathBuf>,
     },
 
-    /// Generate a Zero-Knowledge Proof (ZKP) for a clinical threshold condition
+    /// Decrypt a ciphertext file
+    Decrypt {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(long)]
+        secret_key: PathBuf,
+    },
+
+    /// Transpose patient records into vertically packed ciphertexts
+    BatchPack {
+        /// A directory of JSON files: PatientRecord, a list of them, or FHIR Bundles
+        #[arg(short, long)]
+        input_dir: PathBuf,
+        /// Patients per ciphertext, up to the slot count
+        #[arg(short, long, default_value_t = 4096)]
+        batch_size: usize,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// A public key file. Without one, a new key set is written next to the output
+        #[arg(long)]
+        public_key: Option<PathBuf>,
+        /// LOINC codes to take from FHIR Bundles in the directory
+        #[arg(long)]
+        loinc_filter: Option<String>,
+        /// The site's secret for pseudonyms, created if it does not exist
+        #[arg(long)]
+        pseudonym_key: Option<PathBuf>,
+    },
+
+    /// Fetch from a FHIR R4 server or read a bundle, normalize, and encrypt
+    IngestFhir {
+        /// The server's base URL. Set MEDCRYPTO_FHIR_TOKEN for a bearer token
+        #[arg(short, long, conflicts_with = "bundle")]
+        endpoint: Option<String>,
+        /// A FHIR Bundle file, instead of a server
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+        /// Comma-separated LOINC codes
+        #[arg(short, long)]
+        loinc_filter: String,
+        #[arg(short, long, value_enum, default_value_t = PackMode::Vertical)]
+        mode: PackMode,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(short, long, default_value_t = 4096)]
+        batch_size: usize,
+        #[arg(long, value_enum, default_value_t = WinsorizeArg::Clinical)]
+        winsorize: WinsorizeArg,
+        #[arg(long, value_enum, default_value_t = ImputeArg::None)]
+        impute: ImputeArg,
+        /// A public key file. Without one, a new key set is written next to the output
+        #[arg(long)]
+        public_key: Option<PathBuf>,
+        /// The site's secret for pseudonyms, created if it does not exist
+        #[arg(long)]
+        pseudonym_key: Option<PathBuf>,
+        /// The envelope key store, for horizontal mode
+        #[arg(long, default_value = "medcrypto-keystore.json")]
+        key_store: PathBuf,
+        /// Allow http:// to a remote server, which sends patient data in the clear
+        #[arg(long)]
+        allow_insecure_http: bool,
+    },
+
+    /// Combine several sites' vertically packed cohorts
+    CohortMerge {
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Compute count, mean and variance from a vertically packed cohort, with a single secret key
+    CohortStats {
+        #[arg(short, long)]
+        input: PathBuf,
+        /// The directory that keygen wrote
+        #[arg(short, long)]
+        keys: PathBuf,
+        /// Results from fewer patients than this are withheld
+        #[arg(long, default_value_t = 11)]
+        min_cell_size: u64,
+    },
+
+    /// Generate a zero-knowledge proof that a value is within a threshold
     Prove {
         #[arg(short, long, default_value = "hba1c")]
         metric: String,
@@ -60,567 +214,1360 @@ enum Commands {
         value: u64,
         #[arg(short, long, default_value_t = 65)]
         threshold: u64,
-        #[arg(long, default_value_t = true)]
-        upper_bound: bool,
+        /// Prove value >= threshold, instead of value <= threshold
+        #[arg(long)]
+        lower_bound: bool,
+        #[arg(long, value_enum, default_value_t = BackendArg::Pedersen)]
+        backend: BackendArg,
+        #[arg(long, value_enum, default_value_t = ProfileArg::Development)]
+        profile: ProfileArg,
+        /// The guest program, for the stark backend
+        #[arg(long)]
+        guest_elf: Option<PathBuf>,
+        /// The prover executable, for the stark backend
+        #[arg(long)]
+        runner: Option<PathBuf>,
         #[arg(short, long)]
-        output: Option<String>,
+        output: Option<PathBuf>,
     },
 
-    /// Verify a Zero-Knowledge Proof
+    /// Verify a zero-knowledge proof
     Verify {
         #[arg(short, long)]
-        proof_file: String,
+        proof_file: PathBuf,
+        #[arg(long, value_enum, default_value_t = BackendArg::Pedersen)]
+        backend: BackendArg,
+        #[arg(long, value_enum, default_value_t = ProfileArg::Development)]
+        profile: ProfileArg,
+        #[arg(long)]
+        guest_elf: Option<PathBuf>,
+        #[arg(long)]
+        runner: Option<PathBuf>,
     },
 
-    /// Irrevocably destroy an ephemeral key (GDPR Article 17 Cryptographic Shredding)
+    /// Encrypt one record into an envelope that can be erased by destroying its key
+    PackRecord {
+        #[arg(short, long)]
+        record_id: String,
+        /// Comma-separated numbers
+        #[arg(long)]
+        values: String,
+        /// Comma-separated names, one per value
+        #[arg(long)]
+        features: String,
+        #[arg(long)]
+        public_key: PathBuf,
+        #[arg(long, default_value = "medcrypto-keystore.json")]
+        key_store: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Open an envelope and decrypt it, if its key still exists
+    OpenRecord {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(long)]
+        secret_key: PathBuf,
+        #[arg(long, default_value = "medcrypto-keystore.json")]
+        key_store: PathBuf,
+    },
+
+    /// Destroy a record's key for good (GDPR Article 17 cryptographic shredding)
     Shred {
         #[arg(short, long)]
         record_id: String,
+        #[arg(long, default_value = "medcrypto-keystore.json")]
+        key_store: PathBuf,
     },
 
-    /// Perform a Post-Quantum Cryptography (PQC) and lattice hardness audit
-    QuantumAudit,
+    /// Check parameters against the Homomorphic Encryption Standard
+    QuantumAudit {
+        #[arg(long, default_value_t = 8192)]
+        poly_degree: usize,
+    },
 
-    /// Run the full multi-institutional healthcare simulation demo
+    /// Create a certificate authority and everything each consortium member needs
+    ConsortiumInit {
+        #[arg(short, long)]
+        out: PathBuf,
+        #[arg(long, default_value = "medcrypto-consortium")]
+        consortium_id: String,
+        /// Each as id=https://host:port, with the id a lowercase DNS label
+        #[arg(long, required = true, value_delimiter = ',')]
+        nodes: Vec<String>,
+        /// How many nodes it takes to decrypt
+        #[arg(short, long)]
+        threshold: u32,
+        #[arg(long, default_value_t = 8192)]
+        poly_degree: usize,
+    },
+
+    /// Run or query the consortium aggregation daemon
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+
+    /// Run the whole multi-hospital flow on sample data
     Demo,
 }
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Run until interrupted
+    Run {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Ask a node how it is doing
+    Status {
+        /// This node's own configuration
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The node to ask, which defaults to this one
+        #[arg(long)]
+        node: Option<String>,
+    },
+}
+
+type CliResult = Result<(), String>;
 
 fn main() {
     license::enforce_license_or_exit("medcrypto");
     let cli = Cli::parse();
-
-    match cli.command {
+    let result = match cli.command {
         None | Some(Commands::Gui) => {
             println!("Launching MedCrypto Native Desktop GUI...");
-            if let Err(e) = medcrypto::gui::run_gui() {
-                eprintln!("[ERROR] Failed to start native GUI: {}", e);
-            }
+            medcrypto::gui::run_gui().map_err(|e| format!("could not start the GUI: {e}"))
         }
-
-        Some(Commands::InitNode { did, role }) => {
-            println!(
-                "{}",
-                "==========================================================".cyan()
-            );
-            println!(
-                "{}",
-                "  MedCrypto: Initializing Healthcare Node Cryptography   "
-                    .bold()
-                    .cyan()
-            );
-            println!(
-                "{}",
-                "==========================================================".cyan()
-            );
-
-            let mut registry = BlockchainConsentRegistry::new();
-            let role_enum = match role.as_str() {
-                "Patient" => EntityRole::Patient,
-                "Physician" => EntityRole::Physician,
-                _ => EntityRole::HospitalNode,
-            };
-
-            let engine = CKKSEngine::default();
-            let (_sk, pk) = engine.keygen();
-            let pubkey_bytes: Vec<u8> = pk.b.coeffs[0..4]
-                .iter()
-                .flat_map(|c| c.to_be_bytes())
-                .collect();
-            let pubkey_hex = hex::encode(pubkey_bytes);
-
-            registry.register_did(&did, role_enum, &pubkey_hex);
-
-            println!("Node DID:         {}", did.green().bold());
-            println!("Role:             {}", role.yellow());
-            println!("CKKS Ring Modulus: {} (approx 30 bits)", engine.modulus);
-            println!("CKKS Ring Degree:  N={}", engine.degree);
-            println!("Public Key Hash:  0x{}", &pubkey_hex[..16]);
-            println!("\n[SUCCESS] Node cryptographic identity successfully initialized.");
-        }
-
+        Some(Commands::InitNode { did, role }) => init_node(&did, &role),
+        Some(Commands::Keygen {
+            output_dir,
+            poly_degree,
+        }) => engine_for(poly_degree).and_then(|engine| write_keys(&engine, &output_dir)),
         Some(Commands::Encrypt {
             patient_id,
             age,
             hba1c,
             glucose,
             systolic,
+            public_key,
             output,
-        }) => {
-            let record = PatientRecord::mock_patient(&patient_id, age, hba1c, glucose, systolic);
-            let engine = CKKSEngine::default();
-            let (_sk, pk) = engine.keygen();
-
-            let ct = engine.encrypt(&pk, &record.to_vector());
-            let json = serde_json::to_string_pretty(&ct).unwrap();
-
-            if let Some(path) = output {
-                fs::write(&path, json).expect("Failed to write ciphertext");
-                println!("[SUCCESS] Ciphertext written to {}", path);
-            } else {
-                println!("{}", "--- Encrypted CKKS Ciphertext Summary ---".bold());
-                println!("Patient Pseudo-ID: {}", record.pseudo_id);
-                println!("Ciphertext Scale:  {}", ct.scale);
-                println!(
-                    "Encrypted Slots:   {} continuous clinical dimensions",
-                    ct.num_slots
-                );
-                println!("Coefficients size: {} bytes", ct.c0.coeffs.len() * 8 * 2);
-            }
-        }
-
+        }) => encrypt(
+            &patient_id,
+            age,
+            hba1c,
+            glucose,
+            systolic,
+            public_key,
+            output,
+        ),
+        Some(Commands::Decrypt { input, secret_key }) => decrypt(&input, &secret_key),
+        Some(Commands::BatchPack {
+            input_dir,
+            batch_size,
+            output,
+            public_key,
+            loinc_filter,
+            pseudonym_key,
+        }) => batch_pack(
+            &input_dir,
+            batch_size,
+            &output,
+            public_key,
+            loinc_filter,
+            pseudonym_key,
+        ),
+        Some(Commands::IngestFhir {
+            endpoint,
+            bundle,
+            loinc_filter,
+            mode,
+            output,
+            batch_size,
+            winsorize,
+            impute,
+            public_key,
+            pseudonym_key,
+            key_store,
+            allow_insecure_http,
+        }) => ingest_fhir(IngestArgs {
+            endpoint,
+            bundle,
+            loinc_filter,
+            mode,
+            output,
+            batch_size,
+            winsorize,
+            impute,
+            public_key,
+            pseudonym_key,
+            key_store,
+            allow_insecure_http,
+        }),
+        Some(Commands::CohortMerge { inputs, output }) => cohort_merge(&inputs, &output),
+        Some(Commands::CohortStats {
+            input,
+            keys,
+            min_cell_size,
+        }) => cohort_stats(&input, &keys, min_cell_size),
         Some(Commands::Prove {
             metric,
             value,
             threshold,
-            upper_bound,
+            lower_bound,
+            backend,
+            profile,
+            guest_elf,
+            runner,
             output,
-        }) => {
-            let blinding = ZKPEngine::random_blinding();
-            match ZKPEngine::prove_threshold(value, blinding, threshold, upper_bound) {
-                Ok(proof) => {
-                    println!(
-                        "{}",
-                        "==========================================================".green()
-                    );
-                    println!(
-                        "{}",
-                        "   Zero-Knowledge Proof Generated Successfully            "
-                            .bold()
-                            .green()
-                    );
-                    println!(
-                        "{}",
-                        "==========================================================".green()
-                    );
-                    println!("Metric Target:    {}", metric.bold());
-                    println!(
-                        "Claim:            value {} {} (Zero-Knowledge: actual value is hidden)",
-                        if upper_bound { "<=" } else { ">=" },
-                        threshold
-                    );
-                    println!("Proof Hash:       0x{}", proof.proof_hash);
-                    println!("Challenge (c):    {}", proof.challenge);
-
-                    if let Some(path) = output {
-                        let json = serde_json::to_string_pretty(&proof).unwrap();
-                        fs::write(&path, json).expect("Failed to write proof file");
-                        println!("\nProof saved to {}", path);
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "{}",
-                        format!("[ERROR] Proof generation failed: {}", e).red()
-                    );
-                }
-            }
+        }) => prove(
+            &metric,
+            value,
+            threshold,
+            lower_bound,
+            backend,
+            profile,
+            guest_elf,
+            runner,
+            output,
+        ),
+        Some(Commands::Verify {
+            proof_file,
+            backend,
+            profile,
+            guest_elf,
+            runner,
+        }) => verify(&proof_file, backend, profile, guest_elf, runner),
+        Some(Commands::PackRecord {
+            record_id,
+            values,
+            features,
+            public_key,
+            key_store,
+            output,
+        }) => pack_record(
+            &record_id,
+            &values,
+            &features,
+            &public_key,
+            &key_store,
+            &output,
+        ),
+        Some(Commands::OpenRecord {
+            input,
+            secret_key,
+            key_store,
+        }) => open_record(&input, &secret_key, &key_store),
+        Some(Commands::Shred {
+            record_id,
+            key_store,
+        }) => shred(&record_id, &key_store),
+        Some(Commands::QuantumAudit { poly_degree }) => {
+            engine_for(poly_degree).map(|e| quantum_audit(&e))
         }
-
-        Some(Commands::Verify { proof_file }) => {
-            let data = fs::read_to_string(&proof_file).expect("Failed to read proof file");
-            let proof: medcrypto::zkp::ThresholdProof =
-                serde_json::from_str(&data).expect("Invalid proof format");
-
-            let valid = ZKPEngine::verify_threshold(&proof);
-            if valid {
-                println!(
-                    "{}",
-                    "[VERIFIED] Zero-Knowledge Proof is mathematically VALID."
-                        .bold()
-                        .green()
-                );
-                println!("The claimed condition is satisfied without revealing underlying clinical data.");
-            } else {
-                println!(
-                    "{}",
-                    "[FAILED] Zero-Knowledge Proof verification FAILED."
-                        .bold()
-                        .red()
-                );
-            }
-        }
-
-        Some(Commands::Shred { record_id }) => {
-            let mut km = KeyManager::new();
-            let envelope = km.encrypt(&record_id, b"Sensitive PHI payload");
-            match km.shred_key(&envelope.key_id, &record_id) {
-                Ok(cert) => {
-                    println!(
-                        "{}",
-                        "==========================================================".red()
-                    );
-                    println!(
-                        "{}",
-                        "  GDPR Article 17: Cryptographic Shredding Completed     "
-                            .bold()
-                            .red()
-                    );
-                    println!(
-                        "{}",
-                        "==========================================================".red()
-                    );
-                    println!("Record ID:        {}", cert.record_id);
-                    println!("Destroyed Key ID: {}", cert.key_id);
-                    println!("Timestamp:        {}", cert.timestamp);
-                    println!("Legal Basis:      {}", cert.regulatory_basis);
-                    println!("Audit Signature:  0x{}", cert.audit_signature);
-                    println!("\n[CONFIRMED] Decryption key has been irrevocably zeroized.");
-                    println!("The associated ciphertext on storage/blockchain is now mathematically unrecoverable.");
-                }
-                Err(e) => eprintln!("[ERROR] Shredding failed: {}", e),
-            }
-        }
-
-        Some(Commands::QuantumAudit) => {
-            let report = QuantumAuditor::evaluate_rlwe_security(128, 1_073_741_789, 3.2);
-
-            let mut table = Table::new();
-            table
-                .load_preset(UTF8_FULL)
-                .apply_modifier(UTF8_ROUND_CORNERS)
-                .set_header(vec![
-                    Cell::new("Security Parameter").fg(Color::Cyan),
-                    Cell::new("Specification / Assessment").fg(Color::Yellow),
-                ]);
-
-            table.add_row(vec!["Algorithm Family", &report.algorithm_family]);
-            table.add_row(vec!["Underlying Hard Problem", &report.hard_problem]);
-            table.add_row(vec![
-                "Ring Dimension (N)",
-                &report.ring_dimension_n.to_string(),
-            ]);
-            table.add_row(vec![
-                "Modulus Bit Length (q)",
-                &format!("{} bits", report.modulus_bits_q),
-            ]);
-            table.add_row(vec![
-                "Shor's Algorithm Resistance",
-                if report.shor_algorithm_resistant {
-                    "PASSED (Immune to Period Finding)"
-                } else {
-                    "FAILED"
-                },
-            ]);
-            table.add_row(vec![
-                "Grover Search Security",
-                &format!(
-                    "{} bits (Post-Quantum Equivalent)",
-                    report.grover_security_bits
-                ),
-            ]);
-            table.add_row(vec![
-                "Quantum Sieving Security (BKZ/BDGL)",
-                &format!(
-                    "~{} bits (SVP Hardness)",
-                    report.quantum_sieving_security_bits
-                ),
-            ]);
-            table.add_row(vec!["NIST PQC Assessment", &report.nist_security_level]);
-
-            println!(
-                "{}",
-                "\n>>> Post-Quantum Cryptography (PQC) Security Audit Report <<<"
-                    .bold()
-                    .cyan()
-            );
-            println!("{table}");
-
-            println!("\n{}", "Post-Quantum Recommendations:".bold());
-            for rec in &report.post_quantum_recommendations {
-                println!("  * {}", rec);
-            }
-        }
-
+        Some(Commands::ConsortiumInit {
+            out,
+            consortium_id,
+            nodes,
+            threshold,
+            poly_degree,
+        }) => consortium_init(&out, &consortium_id, &nodes, threshold, poly_degree),
+        Some(Commands::Daemon { action }) => daemon(action),
         Some(Commands::Demo) => {
             run_interactive_demo();
+            Ok(())
+        }
+    };
+    if let Err(message) = result {
+        eprintln!("{} {message}", "[ERROR]".red().bold());
+        std::process::exit(1);
+    }
+}
+
+fn engine_for(poly_degree: usize) -> Result<CKKSEngine, String> {
+    CkksPreset::from_degree(poly_degree)
+        .map(CKKSEngine::from_preset)
+        .ok_or_else(|| format!("poly degree {poly_degree}: use 8192 or 16384"))
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("{path:?}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("{path:?}: {e}"))
+}
+
+fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> CliResult {
+    let text = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|e| format!("{parent:?}: {e}"))?;
+    }
+    fs::write(path, text).map_err(|e| format!("{path:?}: {e}"))
+}
+
+fn write_secret_json<T: serde::Serialize>(path: &Path, value: &T) -> CliResult {
+    let text = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    medcrypto::consortium::write_private_file(path, text.as_bytes())
+        .map_err(|e| format!("{path:?}: {e}"))
+}
+
+/// Which engine a key was made for: the parameter identifier says, so nothing else needs to be given.
+fn engine_for_param_id(param_id: u64) -> Result<CKKSEngine, String> {
+    [CkksPreset::N8192, CkksPreset::N16384]
+        .into_iter()
+        .map(CKKSEngine::from_preset)
+        .find(|e| e.context().param_id() == param_id)
+        .ok_or_else(|| format!("no known parameter set has the identifier {param_id}"))
+}
+
+fn write_keys(engine: &CKKSEngine, directory: &Path) -> CliResult {
+    let (secret, public) = engine.keygen();
+    println!(
+        "Generating rotation and relinearization keys for N = {}...",
+        engine.context().poly_degree
+    );
+    let galois = engine.galois_keygen(&secret, &engine.sum_rotation_steps());
+    let relin = engine.relin_keygen(&secret);
+    write_secret_json(&directory.join("secret-key.json"), &secret)?;
+    write_json(&directory.join("public-key.json"), &public)?;
+    write_json(&directory.join("galois-keys.json"), &galois)?;
+    write_json(&directory.join("relin-key.json"), &relin)?;
+    println!("[SUCCESS] Keys written to {}", directory.display());
+    println!("          secret-key.json stays private. The others can be shared.");
+    Ok(())
+}
+
+fn load_public_key(path: &Path) -> Result<(CKKSEngine, PublicKey), String> {
+    let key: PublicKey = read_json(path)?;
+    let engine = engine_for_param_id(key.param_id)?;
+    engine
+        .validate_public_key(&key)
+        .map_err(|e| format!("{path:?}: {e}"))?;
+    Ok((engine, key))
+}
+
+/// The public key given, or a new key set next to the output so that a first run just works.
+fn public_key_or_new(
+    given: Option<PathBuf>,
+    output: &Path,
+) -> Result<(CKKSEngine, PublicKey), String> {
+    match given {
+        Some(path) => load_public_key(&path),
+        None => {
+            let mut name = output.file_name().unwrap_or_default().to_os_string();
+            name.push(".keys");
+            let directory = output.with_file_name(name);
+            let path = directory.join("public-key.json");
+            if !path.exists() {
+                eprintln!(
+                    "{} no --public-key given, so creating keys in {}",
+                    "[NOTE]".yellow(),
+                    directory.display()
+                );
+                write_keys(&CKKSEngine::default(), &directory)?;
+            }
+            load_public_key(&path)
         }
     }
 }
 
-fn run_interactive_demo() {
+/// The site's pseudonym key, created at first use.
+fn pseudonym_key(given: Option<PathBuf>, output: &Path) -> Result<Vec<u8>, String> {
+    let path = given.unwrap_or_else(|| {
+        let mut name = output.file_name().unwrap_or_default().to_os_string();
+        name.push(".pseudonym-key");
+        output.with_file_name(name)
+    });
+    if path.exists() {
+        let text = fs::read_to_string(&path).map_err(|e| format!("{path:?}: {e}"))?;
+        return hex::decode(text.trim()).map_err(|e| format!("{path:?}: {e}"));
+    }
+    let mut key = vec![0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    medcrypto::consortium::write_private_file(&path, hex::encode(&key).as_bytes())
+        .map_err(|e| format!("{path:?}: {e}"))?;
+    eprintln!(
+        "{} created the pseudonym key {}. Keep it, or pseudonyms will change.",
+        "[NOTE]".yellow(),
+        path.display()
+    );
+    Ok(key)
+}
+
+fn init_node(did: &str, role: &str) -> CliResult {
     println!(
         "{}",
-        "========================================================================="
+        "==========================================================".cyan()
+    );
+    println!(
+        "{}",
+        "  MedCrypto: Initializing Healthcare Node Cryptography   "
             .bold()
             .cyan()
     );
     println!(
         "{}",
-        "   MEDCRYPTA: CROSS-HOSPITAL PRIVACY-PRESERVING SHARING ENGINE DEMO      "
-            .bold()
-            .cyan()
+        "==========================================================".cyan()
+    );
+    let mut registry = BlockchainConsentRegistry::new();
+    let role_enum = match role {
+        "Patient" => EntityRole::Patient,
+        "Physician" => EntityRole::Physician,
+        _ => EntityRole::HospitalNode,
+    };
+    let engine = CKKSEngine::default();
+    let (_secret, public) = engine.keygen();
+    let fingerprint: Vec<u8> = public
+        .b
+        .preview(4)
+        .iter()
+        .flat_map(|c| c.to_be_bytes())
+        .collect();
+    let fingerprint = hex::encode(fingerprint);
+    registry.register_did(did, role_enum, &fingerprint);
+    let context = engine.context();
+    println!("Node DID:          {}", did.green().bold());
+    println!("Role:              {}", role.yellow());
+    println!(
+        "CKKS Ring Degree:  N={} ({} slots)",
+        context.poly_degree,
+        context.slots()
     );
     println!(
-        "{}",
-        "   (Blockchain DID + Zero-Knowledge Proofs + 4th Gen CKKS FHE + GDPR)    "
-            .bold()
-            .cyan()
+        "RNS Modulus Chain: {} primes + special prime, {} bits",
+        context.moduli_chain.len(),
+        context.total_modulus_bits()
     );
-    println!(
-        "{}",
-        "=========================================================================\n"
-            .bold()
-            .cyan()
-    );
+    println!("Public Key Print:  0x{}", &fingerprint[..16]);
+    println!("\n[SUCCESS] Node identity shown. This key is throwaway: use `keygen` to keep one.");
+    Ok(())
+}
 
-    // 1. Setup Consortium Blockchain & Identities
-    println!(
-        "{}",
-        "[STEP 1] Consortium Blockchain & W3C DID Registration"
-            .bold()
-            .yellow()
-    );
-    let mut blockchain = BlockchainConsentRegistry::new();
-    let hospital_a = "did:med:hospital:seoul-national";
-    let hospital_b = "did:med:hospital:asani-medical";
-    let patient_did = "did:med:patient:8f92b1a";
-    let doctor_b_did = "did:med:doctor:dr-choi";
+fn encrypt(
+    patient_id: &str,
+    age: f64,
+    hba1c: f64,
+    glucose: f64,
+    systolic: f64,
+    public_key: Option<PathBuf>,
+    output: Option<PathBuf>,
+) -> CliResult {
+    let record = PatientRecord::mock_patient(patient_id, age, hba1c, glucose, systolic);
+    let key_location = output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("ciphertext.json"));
+    let (engine, key) = public_key_or_new(public_key, &key_location)?;
+    let ciphertext = engine
+        .encrypt(&key, &record.to_vector())
+        .map_err(|e| e.to_string())?;
+    if let Some(path) = output {
+        write_json(&path, &ciphertext)?;
+        println!("[SUCCESS] Ciphertext written to {}", path.display());
+    } else {
+        println!("{}", "--- Encrypted CKKS Ciphertext Summary ---".bold());
+        println!("Patient Pseudo-ID: {}", record.pseudo_id);
+        println!("Ciphertext Scale:  2^{:.0}", ciphertext.scale.log2());
+        println!(
+            "Encrypted Slots:   {} clinical dimensions",
+            ciphertext.num_slots
+        );
+        println!("Level:             {}", ciphertext.level());
+        println!(
+            "Size:              {} bytes",
+            to_bytes(&ciphertext).map_err(|e| e.to_string())?.len()
+        );
+    }
+    Ok(())
+}
 
-    blockchain.register_did(hospital_a, EntityRole::HospitalNode, "0x1111222233334444");
-    blockchain.register_did(hospital_b, EntityRole::HospitalNode, "0x5555666677778888");
-    blockchain.register_did(patient_did, EntityRole::Patient, "0x9999aaaabbbbcccc");
-    blockchain.register_did(doctor_b_did, EntityRole::Physician, "0xddddeeeeffff0000");
+fn decrypt(input: &Path, secret_key: &Path) -> CliResult {
+    let ciphertext: Ciphertext = read_json(input)?;
+    let secret: SecretKey = read_json(secret_key)?;
+    let engine = engine_for_param_id(ciphertext.param_id)?;
+    engine
+        .validate_ciphertext(&ciphertext)
+        .map_err(|e| format!("{input:?}: {e}"))?;
+    engine
+        .validate_secret_key(&secret)
+        .map_err(|e| format!("{secret_key:?}: {e}"))?;
+    let values = engine
+        .decrypt(&secret, &ciphertext)
+        .map_err(|e| e.to_string())?;
+    let shown: Vec<String> = values.iter().map(|v| format!("{v:.4}")).collect();
+    println!("{}", shown.join(", "));
+    Ok(())
+}
 
-    println!("  * Registered Hospital A: {}", hospital_a);
-    println!("  * Registered Hospital B: {}", hospital_b);
-    println!("  * Registered Patient:    {}", patient_did);
-    println!("  * Registered Doctor B:   {}", doctor_b_did);
+fn table_from_records(records: &[PatientRecord]) -> CohortTable {
+    let columns = [
+        ("age", "Age", "a"),
+        ("systolic_bp", "Systolic blood pressure", "mm[Hg]"),
+        ("diastolic_bp", "Diastolic blood pressure", "mm[Hg]"),
+        ("fasting_glucose", "Fasting glucose", "mg/dL"),
+        ("hba1c", "Hemoglobin A1c (NGSP)", "%"),
+        ("bmi", "Body mass index", "kg/m2"),
+        ("egfr", "Estimated GFR", "mL/min/{1.73_m2}"),
+        ("ldl_cholesterol", "LDL cholesterol", "mg/dL"),
+    ];
+    CohortTable {
+        columns: columns
+            .iter()
+            .map(
+                |(analyte, display, unit)| medcrypto::fhir::pipeline::Column {
+                    analyte: analyte.to_string(),
+                    display: display.to_string(),
+                    unit: unit.to_string(),
+                },
+            )
+            .collect(),
+        rows: records
+            .iter()
+            .map(|r| Row {
+                pseudo_id: r.pseudo_id.clone(),
+                values: r.to_vector().into_iter().map(Some).collect(),
+            })
+            .collect(),
+        quality: Vec::new(),
+    }
+}
 
-    // 2. Patient Grants Dynamic Consent on Blockchain
-    println!(
-        "\n{}",
-        "[STEP 2] Patient Dynamic Consent Management (Smart Contract)"
-            .bold()
-            .yellow()
-    );
-    let consent = blockchain.grant_consent(
-        patient_did,
-        doctor_b_did,
-        vec!["VITALS_ZKP".to_string(), "CARDIAC_RISK_FHE".to_string()],
-        chrono::Utc::now() + chrono::Duration::days(30),
-    );
-    println!(
-        "  * Consent Granted on-chain! Signature: 0x{}...",
-        &consent.patient_signature[..16]
-    );
-    println!("  * Authorized Scopes: {:?}", consent.allowed_scopes);
-    let is_auth = blockchain.is_authorized(patient_did, doctor_b_did, "VITALS_ZKP");
-    println!(
-        "  * On-chain Authorization Check: {}",
-        if is_auth {
-            "AUTHORIZED".green().bold()
-        } else {
-            "DENIED".red().bold()
-        }
-    );
+fn split_codes(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect()
+}
 
-    // 3. Clinical Data Creation at Hospital A
+fn write_vertical(
+    engine: &CKKSEngine,
+    key: &PublicKey,
+    table: &CohortTable,
+    batch_size: usize,
+    output: &Path,
+) -> CliResult {
     println!(
-        "\n{}",
-        "[STEP 3] Clinical Record Creation at Hospital A (FHIR Standards)"
-            .bold()
-            .yellow()
+        "Encrypting {} patients and {} analytes...",
+        table.rows.len(),
+        table.columns.len()
     );
-    let patient_data = PatientRecord::mock_patient("Patient-8F92", 52.0, 5.9, 108.0, 130.0);
-    println!("  * Patient Raw Values: Age=52, HbA1c=5.9%, Glucose=108mg/dL, Systolic BP=130mmHg");
+    let (cohort, slots) =
+        CohortFile::pack(engine, key, table, batch_size).map_err(|e| e.to_string())?;
+    write_json(output, &cohort)?;
+    let mut name = output.file_name().unwrap_or_default().to_os_string();
+    name.push(".slots");
+    let slot_path = output.with_file_name(name);
+    write_secret_json(&slot_path, &slots)?;
+    let batches = cohort.columns.first().map_or(0, |c| c.batches.len());
+    println!(
+        "[SUCCESS] {} batch(es) per analyte written to {}",
+        batches,
+        output.display()
+    );
+    println!(
+        "          {} maps slots to patients, and stays inside the hospital.",
+        slot_path.display()
+    );
+    print_quality(table);
+    Ok(())
+}
 
-    // 4. Zero-Knowledge Proof: Clinical Trial Eligibility
-    println!(
-        "\n{}",
-        "[STEP 4] Zero-Knowledge Proof: Eligibility Screening (HIPAA Minimum Necessary)"
-            .bold()
-            .yellow()
-    );
-    println!(
-        "  * Goal: Prove HbA1c <= 6.5% WITHOUT revealing the exact value (5.9%) to Hospital B"
-    );
-    let scaled_hba1c = (patient_data.hba1c * 10.0).round() as u64; // 59
-    let blinding = ZKPEngine::random_blinding();
-    let zk_proof = ZKPEngine::prove_threshold(scaled_hba1c, blinding, 65, true).unwrap();
-    println!(
-        "  * ZKP Generated: Announcement R={}, Challenge c={}",
-        zk_proof.announcement, zk_proof.challenge
-    );
-    let verified = ZKPEngine::verify_threshold(&zk_proof);
-    println!(
-        "  * Verifier (Hospital B) Verdict: {}",
-        if verified {
-            "VERIFIED (Satisfies Criteria, Value 0% Disclosed)"
-                .green()
-                .bold()
-        } else {
-            "REJECTED".red().bold()
-        }
-    );
-
-    // 5. 4th Generation Homomorphic Encryption (CKKS): Encrypted Cross-Hospital Analytics
-    println!(
-        "\n{}",
-        "[STEP 5] 4th Generation FHE (CKKS): Multi-Hospital Encrypted Computation"
-            .bold()
-            .yellow()
-    );
-    let fhe = CKKSEngine::default();
-    let (sk, pk) = fhe.keygen();
-
-    // Hospital A and Hospital B encrypt patient cohorts
-    let p_a = PatientRecord::mock_patient("P-A", 50.0, 5.5, 100.0, 120.0);
-    let p_b = PatientRecord::mock_patient("P-B", 60.0, 6.5, 120.0, 140.0);
-
-    let ct_a = fhe.encrypt(&pk, &p_a.to_vector());
-    let ct_b = fhe.encrypt(&pk, &p_b.to_vector());
-    println!(
-        "  * Hospital A encrypted patient vector into CKKS Ciphertext ({} slots)",
-        ct_a.num_slots
-    );
-    println!(
-        "  * Hospital B encrypted patient vector into CKKS Ciphertext ({} slots)",
-        ct_b.num_slots
-    );
-
-    // Untrusted Cloud computes Federated Average over Ciphertexts directly
-    println!("  * Untrusted Cloud Computing Federated Average on Ciphertexts directly (Zero Decryption)...");
-    let ct_avg = fhe.federated_average(&[ct_a, ct_b]);
-
-    // Decrypting ONLY the aggregated statistical result
-    let decrypted_avg = fhe.decrypt(&sk, &ct_avg);
-
-    let mut vitals_table = Table::new();
-    vitals_table
-        .load_preset(UTF8_FULL)
+fn print_quality(table: &CohortTable) {
+    if table.quality.is_empty() {
+        return;
+    }
+    let mut out = Table::new();
+    out.load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS)
         .set_header(vec![
-            Cell::new("Clinical Metric").fg(Color::Cyan),
-            Cell::new("Hospital A (Raw)").fg(Color::White),
-            Cell::new("Hospital B (Raw)").fg(Color::White),
-            Cell::new("FHE Decrypted Average").fg(Color::Green),
+            "Analyte",
+            "Unit",
+            "Results",
+            "Unknown unit",
+            "Implausible",
+            "Winsorized",
+            "Missing",
+            "Imputed",
         ]);
-
-    let names = PatientRecord::feature_names();
-    let vec_a = p_a.to_vector();
-    let vec_b = p_b.to_vector();
-    for i in 0..4 {
-        vitals_table.add_row(vec![
-            Cell::new(names[i]),
-            Cell::new(format!("{:.1}", vec_a[i])),
-            Cell::new(format!("{:.1}", vec_b[i])),
-            Cell::new(format!("{:.1}", decrypted_avg[i])).fg(Color::Green),
+    for (q, c) in table.quality.iter().zip(&table.columns) {
+        out.add_row(vec![
+            q.analyte.clone(),
+            c.unit.clone(),
+            q.observations.to_string(),
+            q.unknown_unit.to_string(),
+            q.implausible.to_string(),
+            q.winsorized.to_string(),
+            q.missing.to_string(),
+            q.imputed.to_string(),
         ]);
     }
-    println!("{vitals_table}");
+    println!("{out}");
+}
 
-    // 6. HIPAA Tamper-Proof Audit Trail
+fn batch_pack(
+    input_dir: &Path,
+    batch_size: usize,
+    output: &Path,
+    public_key: Option<PathBuf>,
+    loinc_filter: Option<String>,
+    pseudonym: Option<PathBuf>,
+) -> CliResult {
+    let mut records: Vec<PatientRecord> = Vec::new();
+    let mut bundles = ParsedBundle::default();
+    let mut names: Vec<PathBuf> = fs::read_dir(input_dir)
+        .map_err(|e| format!("{input_dir:?}: {e}"))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    names.sort();
+    for path in names {
+        let text = fs::read_to_string(&path).map_err(|e| format!("{path:?}: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("{path:?}: {e}"))?;
+        if value.get("resourceType").is_some() {
+            bundles.merge(parse_bundle(&text).map_err(|e| format!("{path:?}: {e}"))?);
+        } else if value.is_array() {
+            records.extend(
+                serde_json::from_value::<Vec<PatientRecord>>(value)
+                    .map_err(|e| format!("{path:?}: {e}"))?,
+            );
+        } else {
+            records.push(serde_json::from_value(value).map_err(|e| format!("{path:?}: {e}"))?);
+        }
+    }
+    let table = if !bundles.observations.is_empty() {
+        if !records.is_empty() {
+            return Err("the directory mixes PatientRecord files and FHIR Bundles".to_string());
+        }
+        let codes = split_codes(&loinc_filter.ok_or("FHIR Bundles need --loinc-filter")?);
+        let key = pseudonym_key(pseudonym, output)?;
+        build_table(
+            &bundles,
+            &codes,
+            &PipelineOptions {
+                winsorization: Winsorization::Clinical,
+                imputation: Imputation::None,
+                pseudonym_key: key,
+            },
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        table_from_records(&records)
+    };
+    let (engine, key) = public_key_or_new(public_key, output)?;
+    write_vertical(&engine, &key, &table, batch_size, output)
+}
+
+struct IngestArgs {
+    endpoint: Option<String>,
+    bundle: Option<PathBuf>,
+    loinc_filter: String,
+    mode: PackMode,
+    output: PathBuf,
+    batch_size: usize,
+    winsorize: WinsorizeArg,
+    impute: ImputeArg,
+    public_key: Option<PathBuf>,
+    pseudonym_key: Option<PathBuf>,
+    key_store: PathBuf,
+    allow_insecure_http: bool,
+}
+
+fn ingest_fhir(args: IngestArgs) -> CliResult {
+    let codes = split_codes(&args.loinc_filter);
+    let parsed = match (&args.endpoint, &args.bundle) {
+        (Some(endpoint), None) => {
+            println!("Fetching from {endpoint}...");
+            fetch_observations(
+                endpoint,
+                &codes,
+                &ClientOptions {
+                    bearer_token: std::env::var("MEDCRYPTO_FHIR_TOKEN").ok(),
+                    allow_insecure_http: args.allow_insecure_http,
+                    ..ClientOptions::default()
+                },
+            )
+            .map_err(|e| e.to_string())?
+        }
+        (None, Some(path)) => {
+            let text = fs::read_to_string(path).map_err(|e| format!("{path:?}: {e}"))?;
+            parse_bundle(&text).map_err(|e| format!("{path:?}: {e}"))?
+        }
+        _ => return Err("give either --endpoint or --bundle".to_string()),
+    };
+    println!(
+        "Parsed {} patients and {} observations. Left out: {} by status, {} incomplete, {} other resources.",
+        parsed.patients.len(), parsed.observations.len(),
+        parsed.skipped_status, parsed.skipped_incomplete, parsed.skipped_other
+    );
+    let table = build_table(
+        &parsed,
+        &codes,
+        &PipelineOptions {
+            winsorization: match args.winsorize {
+                WinsorizeArg::Off => Winsorization::Off,
+                WinsorizeArg::Clinical => Winsorization::Clinical,
+                WinsorizeArg::P1p99 => Winsorization::Percentile {
+                    lower: 1.0,
+                    upper: 99.0,
+                },
+            },
+            imputation: match args.impute {
+                ImputeArg::None => Imputation::None,
+                ImputeArg::Median => Imputation::Median,
+                ImputeArg::Mean => Imputation::Mean,
+            },
+            pseudonym_key: pseudonym_key(args.pseudonym_key, &args.output)?,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    if let PackMode::Table = args.mode {
+        write_secret_json(&args.output, &table)?;
+        println!("[SUCCESS] The cleaned table is in {}. It holds patient data, so keep it inside the hospital.", args.output.display());
+        print_quality(&table);
+        return Ok(());
+    }
+    let (engine, key) = public_key_or_new(args.public_key, &args.output)?;
+    match args.mode {
+        PackMode::Table => unreachable!("handled above"),
+        PackMode::Vertical => write_vertical(&engine, &key, &table, args.batch_size, &args.output),
+        PackMode::Horizontal => {
+            let mut keys = KeyManager::open(&args.key_store)?;
+            let features: Vec<String> = table.columns.iter().map(|c| c.analyte.clone()).collect();
+            let mut envelopes = Vec::with_capacity(table.rows.len());
+            for row in &table.rows {
+                // A missing value is NaN in plain data but has no meaning in a slot, so these go in as 0 with a
+                // parallel presence entry for each feature.
+                let values: Vec<f64> = row.values.iter().map(|v| v.unwrap_or(0.0)).collect();
+                let presence: Vec<f64> =
+                    row.values.iter().map(|v| v.map_or(0.0, |_| 1.0)).collect();
+                let mut names = features.clone();
+                names.extend(features.iter().map(|f| format!("{f}.present")));
+                let packed = [values, presence].concat();
+                envelopes.push(
+                    RecordEnvelope::seal(&engine, &key, &mut keys, &row.pseudo_id, names, &packed)
+                        .map_err(|e| e.to_string())?,
+                );
+            }
+            // The keys go to disk before the envelopes, which would be useless without them.
+            keys.save()?;
+            write_json(&args.output, &envelopes)?;
+            println!(
+                "[SUCCESS] {} envelopes written to {}",
+                envelopes.len(),
+                args.output.display()
+            );
+            print_quality(&table);
+            Ok(())
+        }
+    }
+}
+
+fn load_cohort(path: &Path) -> Result<(CKKSEngine, CohortFile), String> {
+    let cohort: CohortFile = read_json(path)?;
+    let engine = engine_for_param_id(cohort.param_id)?;
+    cohort
+        .validate(&engine)
+        .map_err(|e| format!("{path:?}: {e}"))?;
+    Ok((engine, cohort))
+}
+
+fn cohort_merge(inputs: &[PathBuf], output: &Path) -> CliResult {
+    let (_, mut merged) = load_cohort(&inputs[0])?;
+    for path in &inputs[1..] {
+        let (_, next) = load_cohort(path)?;
+        merged = merged.merge(next).map_err(|e| format!("{path:?}: {e}"))?;
+    }
+    write_json(output, &merged)?;
+    println!(
+        "[SUCCESS] {} cohorts merged into {}",
+        inputs.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn cohort_stats(input: &Path, keys: &Path, min_cell_size: u64) -> CliResult {
+    let (engine, cohort) = load_cohort(input)?;
+    let secret: SecretKey = read_json(&keys.join("secret-key.json"))?;
+    let galois: GaloisKey = read_json(&keys.join("galois-keys.json"))?;
+    engine
+        .validate_secret_key(&secret)
+        .map_err(|e| e.to_string())?;
+    engine
+        .validate_galois_key(&galois)
+        .map_err(|e| e.to_string())?;
+    println!("Summing slots homomorphically...");
+    let aggregates = cohort
+        .aggregate(&engine, &galois)
+        .map_err(|e| e.to_string())?;
+    let mut out = Table::new();
+    out.load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_header(vec!["Analyte", "Unit", "Count", "Mean", "Std. deviation"]);
+    for aggregate in &aggregates {
+        let first = |ct: &Ciphertext| -> Result<f64, String> {
+            Ok(engine.decrypt(&secret, ct).map_err(|e| e.to_string())?[0])
+        };
+        let count = first(&aggregate.count)?;
+        if count.round() < min_cell_size as f64 {
+            out.add_row(vec![
+                aggregate.column.analyte.clone(),
+                aggregate.column.unit.clone(),
+                format!("fewer than {min_cell_size}"),
+                "withheld".to_string(),
+                "withheld".to_string(),
+            ]);
+            continue;
+        }
+        let stats = AnalyteStatistics::from_totals(
+            &aggregate.column,
+            first(&aggregate.sum)?,
+            first(&aggregate.sum_of_squares)?,
+            count,
+        );
+        out.add_row(vec![
+            stats.analyte,
+            stats.unit,
+            stats.count.to_string(),
+            format!("{:.3}", stats.mean),
+            stats
+                .standard_deviation
+                .map_or("-".to_string(), |s| format!("{s:.3}")),
+        ]);
+    }
+    println!("{out}");
+    Ok(())
+}
+
+fn proof_backend(
+    backend: BackendArg,
+    profile: ProfileArg,
+    guest_elf: Option<PathBuf>,
+    runner: Option<PathBuf>,
+) -> Result<Box<dyn medcrypto::zkp::ZkPredicateProver>, String> {
+    let profile = match profile {
+        ProfileArg::Development => Profile::Development,
+        ProfileArg::Production => Profile::Production,
+    };
+    let stark = match backend {
+        BackendArg::Pedersen => None,
+        BackendArg::Stark => Some(StarkCoprocessorBackend::new(
+            guest_elf.ok_or("the stark backend needs --guest-elf")?,
+            runner.ok_or("the stark backend needs --runner")?,
+        )),
+    };
+    backend_for_profile(profile, stark).map_err(|e| e.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove(
+    metric: &str,
+    value: u64,
+    threshold: u64,
+    lower_bound: bool,
+    backend: BackendArg,
+    profile: ProfileArg,
+    guest_elf: Option<PathBuf>,
+    runner: Option<PathBuf>,
+    output: Option<PathBuf>,
+) -> CliResult {
+    let prover = proof_backend(backend, profile, guest_elf, runner)?;
+    let proof = ZKPEngine::prove_threshold_with(prover.as_ref(), value, threshold, !lower_bound)
+        .map_err(|e| format!("no proof made: {e}"))?;
     println!(
         "{}",
-        "[STEP 6] HIPAA §164.528 Accounting of Disclosures Audit Trail"
-            .bold()
-            .yellow()
-    );
-    let mut audit = AuditLedger::new();
-    audit.append(
-        doctor_b_did,
-        hospital_a,
-        &patient_data.pseudo_id,
-        "CLINICAL_TRIAL_SCREENING",
-        "ZKP_VERIFY",
-        &zk_proof.proof_hash,
-    );
-    audit.append(
-        doctor_b_did,
-        hospital_b,
-        &patient_data.pseudo_id,
-        "EPIDEMIOLOGICAL_STUDY",
-        "FHE_FEDERATED_AVG",
-        "0x78ab39ef201c",
-    );
-    println!("  * Audit Entries Recorded: {}", audit.entries.len());
-    println!(
-        "  * Audit Chain Cryptographic Integrity: {}",
-        if audit.verify_integrity() {
-            "VERIFIED (Tamper-Proof)".green().bold()
-        } else {
-            "CORRUPTED".red().bold()
-        }
-    );
-
-    // 7. GDPR Article 17: Right to Erasure / Cryptographic Shredding
-    println!(
-        "\n{}",
-        "[STEP 7] GDPR Article 17: Right to Erasure / Cryptographic Shredding"
-            .bold()
-            .yellow()
-    );
-    let mut km = KeyManager::new();
-    let envelope = km.encrypt(
-        &patient_data.patient_id,
-        b"Detailed Genomic and PHI records",
-    );
-    println!(
-        "  * Data protected under Ephemeral Key Envelope: {}",
-        envelope.key_id
-    );
-
-    // Patient revokes consent and demands erasure
-    let shred_cert = km
-        .shred_key(&envelope.key_id, &patient_data.patient_id)
-        .unwrap();
-    println!("  * Patient triggered consent revocation: KEY DESTROYED.");
-    println!(
-        "  * Shredding Certificate Issued: 0x{}...",
-        &shred_cert.audit_signature[..16]
-    );
-
-    let decrypt_attempt = km.decrypt(&envelope);
-    println!(
-        "  * Post-Erasure Decryption Attempt: {}",
-        match decrypt_attempt {
-            Ok(_) => "SECURITY VIOLATION: Still readable!".red().bold(),
-            Err(e) => format!("SUCCESSFULLY BLOCKED ({})", e).green().bold(),
-        }
-    );
-
-    // 8. Post-Quantum Cryptography Verification
-    println!(
-        "\n{}",
-        "[STEP 8] Post-Quantum Cryptography (PQC) Verification"
-            .bold()
-            .yellow()
-    );
-    let report = QuantumAuditor::evaluate_rlwe_security(128, 1_073_741_789, 3.2);
-    println!("  * CKKS Hardness: {} (RLWE Lattice)", report.hard_problem);
-    println!(
-        "  * Shor's Algorithm Status: {}",
-        if report.shor_algorithm_resistant {
-            "IMMUNE (No period-finding vulnerability)".green().bold()
-        } else {
-            "VULNERABLE".red()
-        }
-    );
-    println!(
-        "  * Quantum Sieving Hardness: ~{} bits",
-        report.quantum_sieving_security_bits
-    );
-    println!(
-        "  * Grover Hashing Security:  {} bits",
-        report.grover_security_bits
-    );
-
-    println!(
-        "\n{}",
-        "========================================================================="
-            .bold()
-            .cyan()
+        "==========================================================".green()
     );
     println!(
         "{}",
-        "   ALL SECURITY, PRIVACY, COMPLIANCE & PQC CHECKS PASSED (100%)          "
+        "   Zero-Knowledge Proof Generated Successfully            "
             .bold()
             .green()
     );
     println!(
         "{}",
+        "==========================================================".green()
+    );
+    println!("Metric Target:    {}", metric.bold());
+    println!(
+        "Claim:            value {} {threshold} (the value itself stays hidden)",
+        if lower_bound { ">=" } else { "<=" }
+    );
+    println!("Backend:          {}", proof.proof.backend);
+    println!("Commitment:       0x{}", proof.commitment());
+    println!("Proof Hash:       0x{}", proof.proof_hash);
+    if let Some(path) = output {
+        write_json(&path, &proof)?;
+        println!("\nProof saved to {}", path.display());
+    }
+    Ok(())
+}
+
+fn verify(
+    proof_file: &Path,
+    backend: BackendArg,
+    profile: ProfileArg,
+    guest_elf: Option<PathBuf>,
+    runner: Option<PathBuf>,
+) -> CliResult {
+    let proof: ThresholdProof = read_json(proof_file)?;
+    let verifier = proof_backend(backend, profile, guest_elf, runner)?;
+    if ZKPEngine::verify_threshold_with(verifier.as_ref(), &proof) {
+        println!("{}", "[VERIFIED] The proof is valid.".bold().green());
+        println!(
+            "The committed value is {} {}, with nothing else revealed about it.",
+            if proof.is_upper_bound {
+                "at most"
+            } else {
+                "at least"
+            },
+            proof.threshold
+        );
+        Ok(())
+    } else {
+        Err("[FAILED] The proof does not verify.".to_string())
+    }
+}
+
+fn pack_record(
+    record_id: &str,
+    values: &str,
+    features: &str,
+    public_key: &Path,
+    key_store: &Path,
+    output: &Path,
+) -> CliResult {
+    let (engine, key) = load_public_key(public_key)?;
+    let values = values
+        .split(',')
+        .map(|v| v.trim().parse::<f64>().map_err(|e| format!("{v}: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let features = split_codes(features);
+    let mut keys = KeyManager::open(key_store)?;
+    let envelope = RecordEnvelope::seal(&engine, &key, &mut keys, record_id, features, &values)
+        .map_err(|e| e.to_string())?;
+    keys.save()?;
+    write_json(output, &envelope)?;
+    println!("[SUCCESS] Envelope written to {}", output.display());
+    println!(
+        "          Its key is {} in {}",
+        envelope.envelope.key_id,
+        key_store.display()
+    );
+    Ok(())
+}
+
+fn open_record(input: &Path, secret_key: &Path, key_store: &Path) -> CliResult {
+    let envelope: RecordEnvelope = read_json(input)?;
+    let secret: SecretKey = read_json(secret_key)?;
+    let engine = engine_for_param_id(secret.param_id)?;
+    engine
+        .validate_secret_key(&secret)
+        .map_err(|e| e.to_string())?;
+    let keys = KeyManager::open(key_store)?;
+    let ciphertext = envelope.open(&engine, &keys).map_err(|e| e.to_string())?;
+    let values = engine
+        .decrypt(&secret, &ciphertext)
+        .map_err(|e| e.to_string())?;
+    for (name, value) in envelope.features.iter().zip(&values) {
+        println!("{name}: {value:.4}");
+    }
+    Ok(())
+}
+
+fn shred(record_id: &str, key_store: &Path) -> CliResult {
+    let mut keys = KeyManager::open(key_store)?;
+    let key_id = KeyManager::key_id_for(record_id);
+    let certificate = keys
+        .shred_key(&key_id, record_id)
+        .map_err(|e| format!("{e} (no key for {record_id} in {})", key_store.display()))?;
+    println!(
+        "{}",
+        "==========================================================".red()
+    );
+    println!(
+        "{}",
+        "  GDPR Article 17: Cryptographic Shredding Completed     "
+            .bold()
+            .red()
+    );
+    println!(
+        "{}",
+        "==========================================================".red()
+    );
+    println!("Record ID:        {}", certificate.record_id);
+    println!("Destroyed Key ID: {}", certificate.key_id);
+    println!("Timestamp:        {}", certificate.timestamp);
+    println!("Legal Basis:      {}", certificate.regulatory_basis);
+    println!("Audit Digest:     0x{}", certificate.audit_signature);
+    println!(
+        "\n[CONFIRMED] The key is gone from {}.",
+        key_store.display()
+    );
+    println!("Envelopes for this record can no longer be opened. Backups of the key store must be handled");
+    println!("separately, and any vertical batch holding this patient must be packed again without them.");
+    Ok(())
+}
+
+fn quantum_audit(engine: &CKKSEngine) {
+    let report = QuantumAuditor::evaluate_context(engine.context());
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_header(vec![
+            Cell::new("Security Parameter").fg(Color::Cyan),
+            Cell::new("Specification / Assessment").fg(Color::Yellow),
+        ]);
+    let limit = |l: Option<u32>| l.map_or("not covered".to_string(), |x| format!("{x} bits"));
+    table.add_row(vec!["Algorithm Family", &report.algorithm_family]);
+    table.add_row(vec!["Underlying Hard Problem", &report.hard_problem]);
+    table.add_row(vec![
+        "Ring Dimension (N)",
+        &report.ring_dimension_n.to_string(),
+    ]);
+    table.add_row(vec![
+        "Total Modulus (QP)",
+        &format!("{} bits", report.modulus_bits_qp),
+    ]);
+    table.add_row(vec![
+        "HE Standard Limit, Quantum 128",
+        &limit(report.limit_bits_quantum_128),
+    ]);
+    table.add_row(vec![
+        "HE Standard Limit, Classical 128",
+        &limit(report.limit_bits_classical_128),
+    ]);
+    table.add_row(vec!["Assessment", &report.security_assessment]);
+    table.add_row(vec![
+        "Hash Chains Against Grover",
+        &format!("{} bits", report.grover_security_bits),
+    ]);
+    table.add_row(vec![
+        "Pedersen Proofs Against Shor",
+        if report.zkp_commitment_quantum_safe {
+            "safe"
+        } else {
+            "broken by a quantum computer"
+        },
+    ]);
+    println!("{}", "\n>>> Post-Quantum Security Audit <<<".bold().cyan());
+    println!("{table}");
+    println!("\n{}", "Notes:".bold());
+    for note in &report.post_quantum_recommendations {
+        println!("  * {note}");
+    }
+}
+
+fn consortium_init(
+    out: &Path,
+    id: &str,
+    nodes: &[String],
+    threshold: u32,
+    poly_degree: usize,
+) -> CliResult {
+    let nodes = nodes
+        .iter()
+        .map(|text| {
+            let (id, endpoint) = text
+                .split_once('=')
+                .ok_or_else(|| format!("{text}: expected id=https://host:port"))?;
+            let port = endpoint
+                .rsplit(':')
+                .next()
+                .unwrap_or("7443")
+                .trim_end_matches('/');
+            Ok(BootstrapNode {
+                id: id.to_string(),
+                endpoint: endpoint.to_string(),
+                listen: format!("0.0.0.0:{port}"),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let roster = bootstrap_consortium(out, id, &nodes, threshold, poly_degree)?;
+    println!(
+        "[SUCCESS] {}-of-{} consortium written to {}",
+        roster.threshold_k,
+        roster.nodes.len(),
+        out.display()
+    );
+    println!("          Give each hospital its own directory, along with ca.pem, roster.json and studies.json.");
+    println!("          ca-key.pem and each node's keys were all made here. For real institutions, see the README.");
+    Ok(())
+}
+
+fn daemon(action: DaemonAction) -> CliResult {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        match action {
+            DaemonAction::Run { config } => {
+                let config = NodeConfig::load(&config)?;
+                println!("Node {} listening on {}", config.node_id, config.listen);
+                let handle = run_daemon(config).await?;
+                tokio::signal::ctrl_c().await.map_err(|e| e.to_string())?;
+                println!("Stopping...");
+                handle.stop().await
+            }
+            DaemonAction::Status { config, node } => {
+                let config = NodeConfig::load(&config)?;
+                let target = node.unwrap_or_else(|| config.node_id.clone());
+                let status = query_status(&config, &target).await?;
+                println!("Node:      {}", status.node_id);
+                println!(
+                    "Keys:      {}",
+                    if status.keys_ready {
+                        "ready"
+                    } else {
+                        "key generation running"
+                    }
+                );
+                println!("Running:   {:?}", status.jobs_running);
+                println!("Finished:  {:?}", status.jobs_finished);
+                println!("Failed:    {:?}", status.jobs_failed);
+                Ok(())
+            }
+        }
+    })
+}
+
+fn step(title: &str) {
+    println!("\n{}", title.bold().yellow());
+}
+
+fn run_interactive_demo() {
+    use medcrypto::fhe::threshold::{
+        aggregate_public, aggregate_secret, combine, partial_decrypt, DkgParty, ThresholdConfig,
+        DEFAULT_SMUDGING_BITS,
+    };
+    println!(
+        "{}",
         "========================================================================="
             .bold()
             .cyan()
+    );
+    println!(
+        "{}",
+        "   MEDCRYPTO: CROSS-HOSPITAL PRIVACY-PRESERVING SHARING ENGINE DEMO"
+            .bold()
+            .cyan()
+    );
+    println!("{}", "   (All data here is synthetic.)".bold().cyan());
+    println!(
+        "{}",
+        "========================================================================="
+            .bold()
+            .cyan()
+    );
+
+    step("[STEP 1] Consent registry (simulated locally)");
+    let mut chain = BlockchainConsentRegistry::new();
+    let (hospital_a, hospital_b) = ("did:med:hospital:hospital-a", "did:med:hospital:hospital-b");
+    let (patient, doctor) = ("did:med:patient:8f92b1a", "did:med:doctor:dr-choi");
+    chain.register_did(hospital_a, EntityRole::HospitalNode, "0x1111222233334444");
+    chain.register_did(hospital_b, EntityRole::HospitalNode, "0x5555666677778888");
+    chain.register_did(patient, EntityRole::Patient, "0x9999aaaabbbbcccc");
+    chain.register_did(doctor, EntityRole::Physician, "0xddddeeeeffff0000");
+    chain.grant_consent(
+        patient,
+        doctor,
+        vec!["VITALS_ZKP".to_string()],
+        chrono::Utc::now() + chrono::Duration::days(30),
+    );
+    println!(
+        "  * Consent recorded. Authorized for VITALS_ZKP: {}",
+        chain.is_authorized(patient, doctor, "VITALS_ZKP")
+    );
+
+    step("[STEP 2] Range proof: HbA1c <= 6.5%, with the value hidden");
+    let proof = ZKPEngine::prove_threshold(59, 65, true).expect("5.9 is below 6.5");
+    println!(
+        "  * Proof size: {} bytes, commitment 0x{}...",
+        proof.proof.payload.len() / 2,
+        &proof.commitment()[..16]
+    );
+    println!(
+        "  * Verifier's verdict: {}",
+        if ZKPEngine::verify_threshold(&proof) {
+            "VALID".green().bold()
+        } else {
+            "INVALID".red().bold()
+        }
+    );
+    println!(
+        "  * A false claim cannot even be made: {}",
+        ZKPEngine::prove_threshold(82, 65, true).unwrap_err()
+    );
+
+    step("[STEP 3] Distributed key generation among three hospitals, 2-of-3");
+    let engine = CKKSEngine::default();
+    let context = engine.context();
+    println!(
+        "  * N = {}, {} slots, {} modulus bits",
+        context.poly_degree,
+        context.slots(),
+        context.total_modulus_bits()
+    );
+    let mut rng = medcrypto::fhe::ckks::os_seeded_rng();
+    let config = ThresholdConfig::new(3, 2).expect("2-of-3 is possible");
+    let seed = [7u8; 32];
+    let parties: Vec<DkgParty> = (1..=3)
+        .map(|i| DkgParty::new(&engine, config, i, &mut rng).expect("valid party"))
+        .collect();
+    let publics: Vec<_> = parties
+        .iter()
+        .map(|p| p.public_share(&seed, &engine.sum_rotation_steps(), &mut rng))
+        .collect();
+    let keys = aggregate_public(&engine, config, &seed, &publics).expect("all shares are here");
+    let secrets: Vec<_> = parties.iter().map(|p| p.secret_shares(&mut rng)).collect();
+    let shares: Vec<_> = (1..=3u32)
+        .map(|to| {
+            let mine: Vec<_> = secrets.iter().map(|s| s[to as usize - 1].clone()).collect();
+            aggregate_secret(&engine, config, to, &mine).expect("all shares are here")
+        })
+        .collect();
+    println!("  * Nobody ever holds the whole secret key.");
+
+    step("[STEP 4] Vertical packing and homomorphic statistics");
+    let cohort = |prefix: &str, base: f64| -> CohortTable {
+        table_from_records(
+            &(0..200)
+                .map(|i| {
+                    PatientRecord::mock_patient(
+                        &format!("{prefix}-{i}"),
+                        40.0 + (i % 30) as f64,
+                        base + (i % 10) as f64 * 0.1,
+                        100.0,
+                        120.0,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let (table_a, table_b) = (cohort("A", 5.0), cohort("B", 6.0));
+    let (file_a, _) = CohortFile::pack(&engine, &keys.public_key, &table_a, 4096).expect("fits");
+    let (file_b, _) = CohortFile::pack(&engine, &keys.public_key, &table_b, 4096).expect("fits");
+    let merged = file_a.merge(file_b).expect("same analytes");
+    let aggregates = merged
+        .aggregate(&engine, &keys.galois_key)
+        .expect("keys match");
+    println!(
+        "  * Two hospitals' cohorts, 200 patients each, summed on ciphertexts by anyone at all."
+    );
+
+    step("[STEP 5] Threshold decryption of the totals only, by hospitals 1 and 3");
+    let set = [1u32, 3];
+    let open = |ct: &Ciphertext, rng: &mut rand_chacha::ChaCha20Rng| -> f64 {
+        let partials: Vec<_> = set
+            .iter()
+            .map(|&p| {
+                partial_decrypt(
+                    &engine,
+                    &shares[p as usize - 1],
+                    ct,
+                    &set,
+                    DEFAULT_SMUDGING_BITS,
+                    rng,
+                )
+                .expect("valid set")
+            })
+            .collect();
+        combine(&engine, config, ct, &partials).expect("valid partials")[0]
+    };
+    let mut out = Table::new();
+    out.load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_header(vec![
+            Cell::new("Analyte").fg(Color::Cyan),
+            Cell::new("Count"),
+            Cell::new("True mean"),
+            Cell::new("Decrypted mean").fg(Color::Green),
+        ]);
+    for (index, aggregate) in aggregates.iter().enumerate() {
+        let count = open(&aggregate.count, &mut rng);
+        let stats = AnalyteStatistics::from_totals(
+            &aggregate.column,
+            open(&aggregate.sum, &mut rng),
+            open(&aggregate.sum_of_squares, &mut rng),
+            count,
+        );
+        let truth: f64 = table_a
+            .rows
+            .iter()
+            .chain(&table_b.rows)
+            .map(|r| r.values[index].expect("present"))
+            .sum::<f64>()
+            / 400.0;
+        out.add_row(vec![
+            Cell::new(stats.analyte),
+            Cell::new(stats.count),
+            Cell::new(format!("{truth:.3}")),
+            Cell::new(format!("{:.3}", stats.mean)).fg(Color::Green),
+        ]);
+    }
+    println!("{out}");
+
+    step("[STEP 6] Tamper-evident audit trail");
+    let mut audit = AuditLedger::new();
+    audit.append(
+        doctor,
+        hospital_a,
+        "cohort",
+        "CLINICAL_TRIAL_SCREENING",
+        "ZKP_VERIFY",
+        &proof.proof_hash,
+    );
+    audit.append(
+        doctor,
+        hospital_b,
+        "cohort",
+        "EPIDEMIOLOGICAL_STUDY",
+        "FHE_THRESHOLD_RELEASE",
+        "digest",
+    );
+    println!(
+        "  * {} entries, chain intact: {}",
+        audit.entries.len(),
+        audit.verify_integrity()
+    );
+
+    step("[STEP 7] GDPR Article 17: cryptographic shredding");
+    let mut keychain = KeyManager::new();
+    let (secret, public) = engine.keygen();
+    let names = vec!["hba1c".to_string(), "glucose".to_string()];
+    let envelope = RecordEnvelope::seal(
+        &engine,
+        &public,
+        &mut keychain,
+        "patient-8f92",
+        names,
+        &[5.9, 108.0],
+    )
+    .expect("fits");
+    let opened = envelope.open(&engine, &keychain).expect("key exists");
+    println!(
+        "  * Before erasure, the record opens: {:.3?}",
+        engine.decrypt(&secret, &opened).expect("our key")
+    );
+    keychain
+        .shred_key(&envelope.envelope.key_id, "patient-8f92")
+        .expect("key exists");
+    println!(
+        "  * After erasure: {}",
+        envelope.open(&engine, &keychain).unwrap_err()
+    );
+
+    step("[STEP 8] Post-quantum status");
+    let report = QuantumAuditor::evaluate_context(engine.context());
+    println!("  * {}", report.security_assessment);
+    println!("  * Pedersen proofs are not post-quantum, so production needs the STARK runner.");
+
+    println!(
+        "\n{}",
+        "Demo finished. This shows that the flow works: it is not a compliance certification."
+            .bold()
+            .green()
     );
 }

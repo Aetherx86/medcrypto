@@ -141,11 +141,16 @@ impl BlockchainConsentRegistry {
     /// Generates EVM-compatible ABI function calldata for on-chain audit or verification
     /// Method: recordAudit(bytes32 rootHash, bytes32 proofHash)
     pub fn generate_evm_audit_calldata(root_hash: &str, proof_hash: &str) -> String {
-        // Function selector for recordAudit(bytes32,bytes32) -> keccak256("recordAudit(bytes32,bytes32)")[0..4]
-        // Precomputed: 0x8f7311d9
-        let selector = "8f7311d9";
-        let param1 = format!("{:0>64}", root_hash);
-        let param2 = format!("{:0>64}", proof_hash);
+        let selector = hex::encode(function_selector("recordAudit(bytes32,bytes32)"));
+        let param1 = format!("{:0>64}", root_hash.trim_start_matches("0x"));
+        let param2 = format!("{:0>64}", proof_hash.trim_start_matches("0x"));
         format!("0x{}{}{}", selector, param1, param2)
     }
+}
+
+/// The first four bytes of the Keccak-256 of a function signature, which is how the EVM picks a function.
+pub fn function_selector(signature: &str) -> [u8; 4] {
+    use sha3::Keccak256;
+    let digest = Keccak256::digest(signature.as_bytes());
+    [digest[0], digest[1], digest[2], digest[3]]
 }

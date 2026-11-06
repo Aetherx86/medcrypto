@@ -11,3 +11,10 @@ verify-wrong-message false
 merkle-root aeb6bcfe274b70a14fb067a5e5578264db0fa9b51af5e0ba159158f329e06e77
 audit-link dab9cd30fe47420192e7cc74b77d4bf8369f539864ea295418fc9de70229dccd
 constant-time-equal true false
+fhe-public-key b7c09059d075afde7bb399efe931bc5b02c63e4656e587633e3f84b6610a0b62
+fhe-decrypt 120.500 80.000 5.750
+fhe-add 130.500 100.000 6.000
+fhe-scalar-mul 241.000 160.000 11.500
+fhe-scalar-half 60.250 40.000 2.875
+fhe-bad-entropy bad-entropy
+fhe-garbage bad-encoding

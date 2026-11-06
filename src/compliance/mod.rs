@@ -27,9 +27,22 @@ pub struct ShreddingCertificate {
     pub audit_signature: String,
 }
 
+/// Keys held in memory, and optionally in a file so that erasure works across runs.
+///
+/// A file is only as strong as the disk it is on. An erasure removes the key from the current file, but
+/// cannot reach backups, and a journaling file system or SSD may keep old blocks. A real deployment should
+/// keep these keys in an HSM or KMS, whose deletion it can trust.
 pub struct KeyManager {
-    // In-memory / secure enclave key store
     keys: std::collections::HashMap<String, [u8; 32]>,
+    path: Option<std::path::PathBuf>,
+}
+
+impl Drop for KeyManager {
+    fn drop(&mut self) {
+        for key in self.keys.values_mut() {
+            zeroize::Zeroize::zeroize(key);
+        }
+    }
 }
 
 impl Default for KeyManager {
@@ -42,21 +55,74 @@ impl KeyManager {
     pub fn new() -> Self {
         Self {
             keys: std::collections::HashMap::new(),
+            path: None,
         }
     }
 
-    /// Generates a new ephemeral symmetric key for a patient's data envelope
+    /// Uses a key file, which is created on the first save if it does not exist yet.
+    pub fn open(path: impl Into<std::path::PathBuf>) -> Result<Self, String> {
+        let path = path.into();
+        let mut keys = std::collections::HashMap::new();
+        if path.exists() {
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{path:?}: {e}"))?;
+            let stored: std::collections::HashMap<String, String> =
+                serde_json::from_str(&text).map_err(|e| format!("{path:?}: {e}"))?;
+            for (id, value) in stored {
+                let bytes: [u8; 32] = hex::decode(&value)
+                    .ok()
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or_else(|| format!("{path:?}: the key {id} is not 32 bytes of hex"))?;
+                keys.insert(id, bytes);
+            }
+        }
+        Ok(Self {
+            keys,
+            path: Some(path),
+        })
+    }
+
+    fn write_file(
+        path: &std::path::Path,
+        keys: &std::collections::HashMap<String, [u8; 32]>,
+    ) -> Result<(), String> {
+        let stored: std::collections::HashMap<&String, String> =
+            keys.iter().map(|(id, k)| (id, hex::encode(k))).collect();
+        let text = serde_json::to_string_pretty(&stored).map_err(|e| e.to_string())?;
+        crate::consortium::write_private_file(path, text.as_bytes())
+            .map_err(|e| format!("{path:?}: {e}"))
+    }
+
+    /// Writes the keys to the file, if there is one. Do this before relying on a new envelope.
+    pub fn save(&self) -> Result<(), String> {
+        match &self.path {
+            Some(path) => Self::write_file(path, &self.keys),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether a key exists for this record.
+    pub fn has_key_for_record(&self, record_id: &str) -> bool {
+        self.keys.contains_key(&Self::key_id_for(record_id))
+    }
+
+    pub fn key_id_for(record_id: &str) -> String {
+        format!("key:envelope:{record_id}")
+    }
+
+    /// The symmetric key for an id, generated if it does not exist yet. An existing key has to be kept:
+    /// replacing it would make earlier envelopes for the same record undecryptable.
     pub fn create_key(&mut self, key_id: &str) -> [u8; 32] {
-        let key = Aes256Gcm::generate_key(&mut OsRng);
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&key);
-        self.keys.insert(key_id.to_string(), key_bytes);
-        key_bytes
+        *self.keys.entry(key_id.to_string()).or_insert_with(|| {
+            let key = Aes256Gcm::generate_key(&mut OsRng);
+            let mut key_bytes = [0u8; 32];
+            key_bytes.copy_from_slice(&key);
+            key_bytes
+        })
     }
 
     /// Encrypts raw data with ephemeral key
     pub fn encrypt(&mut self, record_id: &str, plaintext: &[u8]) -> EncryptedEnvelope {
-        let key_id = format!("key:envelope:{}", record_id);
+        let key_id = Self::key_id_for(record_id);
         let key_bytes = self.create_key(&key_id);
 
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
@@ -107,9 +173,21 @@ impl KeyManager {
         key_id: &str,
         record_id: &str,
     ) -> Result<ShreddingCertificate, String> {
+        if !self.keys.contains_key(key_id) {
+            return Err("Key already destroyed or non-existent".to_string());
+        }
+        // The file goes first, so that a failure cannot report an erasure which did not happen.
+        if let Some(path) = &self.path {
+            let mut remaining = self.keys.clone();
+            remaining.remove(key_id);
+            let written = Self::write_file(path, &remaining);
+            for key in remaining.values_mut() {
+                zeroize::Zeroize::zeroize(key);
+            }
+            written?;
+        }
         if let Some(mut key) = self.keys.remove(key_id) {
-            // Overwrite key memory with zeros / CSPRNG (zeroize)
-            key.fill(0);
+            zeroize::Zeroize::zeroize(&mut key);
 
             let now = Utc::now();
             let mut hasher = Sha256::new();

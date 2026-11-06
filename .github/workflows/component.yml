@@ -85,10 +85,41 @@ jobs:
           esac
           diff out.txt ../expected.txt
 
+  binaries:
+    name: Command line for ${{ matrix.name }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: hosts
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x86_64 }
+          - { os: macos-latest, name: macos-aarch64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Build
+        env:
+          NAME: ${{ matrix.name }}
+        run: |
+          cargo build --release --locked --bin medcrypto
+          mkdir -p out
+          tar -czf "out/medcrypto-$NAME.tar.gz" -C target/release medcrypto
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: cli-${{ matrix.name }}
+          path: out/*
+
   release:
     name: Publish
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: hosts
+    needs: [hosts, binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -102,17 +133,22 @@ jobs:
         with:
           name: component
           path: dist
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: cli-*
+          path: dist
+          merge-multiple: true
       - name: Check that the tag matches the version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME does not match version $version"; exit 1; }
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
-          subject-path: dist/medcrypto.wasm
+          subject-path: dist/*
       - name: Create
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cd dist && sha256sum medcrypto.wasm > medcrypto.wasm.sha256 && cd ..
+          cd dist && sha256sum medcrypto.wasm > medcrypto.wasm.sha256 && sha256sum medcrypto-*.tar.gz > SHA256SUMS && cd ..
           awk -v v="${GITHUB_REF_NAME#v}" '$0 ~ "^## " v {found=1; next} /^## / {found=0} found' CHANGELOG.md > notes.md
-          gh release create "$GITHUB_REF_NAME" dist/medcrypto.wasm dist/medcrypto.wasm.sha256 --title "$GITHUB_REF_NAME" --notes-file notes.md --latest --verify-tag
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md --latest --verify-tag

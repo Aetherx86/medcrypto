@@ -1,0 +1,12 @@
+# A template for the SP1 guest program, built with SP1's own toolchain and not part of this workspace.
+[package]
+name = "medcrypto-guest-range"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[workspace]
+
+[dependencies]
+sp1-zkvm = "5"
+sha2 = "0.10"

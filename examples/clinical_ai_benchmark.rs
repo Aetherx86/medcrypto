@@ -1,13 +1,11 @@
-// MedCrypto Clinical AI Benchmark Example (VITA AAAI 2024 & COGNet)
+// MedCrypto Clinical AI Example (ideas from VITA, AAAI 2024, and COGNet)
 // Author: Jeong Hoon Kim
 //
 // Demonstrates:
 // 1. Straight-Through Gumbel-Softmax Relevant Visit Selection
 // 2. Target-Aware Cross Attention Context Representation
 // 3. Two-Level Autoregressive Medication Prediction with DDI Suppression
-// 4. Empirical Verification of VITA Hypotheses (PQ1 & PQ2):
-//    - PQ1: Longitudinal Context (All > No)
-//    - PQ2: Relevance Degree Effect (Top-1 > Mid-1 > Bot-1)
+// 4. How the four history strategies behave on one hand-written sample trajectory
 //
 // Usage:
 //   cargo run --example clinical_ai_benchmark
@@ -23,7 +21,7 @@ fn main() {
     println!("==========================================================");
     println!("  MedCrypto: Clinical AI Longitudinal Recommender Demo     ");
     println!("  Author: Jeong Hoon Kim                                  ");
-    println!("  Benchmark: MIMIC-III EHR Trajectory Analysis            ");
+    println!("  One hand-written sample trajectory, not a dataset        ");
     println!("==========================================================\n");
 
     // Trajectory Setup:
@@ -174,26 +172,16 @@ fn main() {
     println!("{}\n", table);
 
     println!("==========================================================");
-    println!("  Empirical Takeaways (VITA, AAAI 2024 Validation):       ");
+    println!("  How to read this:                                       ");
     println!("==========================================================");
     println!(
-        "1. PQ1 Confirmed: Incorporating longitudinal history (All Jaccard: {:.4})",
-        all_jaccard
+        "This is one hand-written trajectory that shows how the selector and predictor behave."
     );
     println!(
-        "   significantly outperforms static snapshots (No Jaccard: {:.4}).",
-        no_jaccard
+        "It is not an evaluation: no dataset was used, and these numbers say nothing about how"
     );
+    println!("the method compares with published models. Here, All scored {all_jaccard:.4}, Top-1 scored");
     println!(
-        "2. PQ2 Confirmed: Selective Top-1 extraction (Jaccard: {:.4}) matches or",
-        top1_jaccard
+        "{top1_jaccard:.4}, Bot-1 scored {bot1_jaccard:.4} and no history scored {no_jaccard:.4}."
     );
-    println!(
-        "   exceeds All visits, while irrelevant Bot-1 noise (Jaccard: {:.4}) drops",
-        bot1_jaccard
-    );
-    println!("   below the zero-history baseline!");
-    println!("3. Privacy Regulatory Guarantee: Selective visit extraction simultaneously");
-    println!("   fulfills HIPAA Minimum Necessary §164.502(b) and GDPR Art. 5(1)(c)");
-    println!("   Data Minimization by refusing to process clinically irrelevant history.");
 }

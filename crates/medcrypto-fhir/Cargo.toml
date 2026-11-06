@@ -1,0 +1,21 @@
+[package]
+name = "medcrypto-fhir"
+version = "0.2.0"
+edition = "2021"
+authors = ["Jeong Hoon Kim"]
+license = "MIT"
+description = "HL7 FHIR R4 ingestion: bundle parsing, LOINC and UCUM normalization, winsorization and imputation"
+publish = false
+
+[features]
+default = ["http"]
+http = ["dep:ureq"]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+hex = "0.4"
+hmac = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "3", optional = true }

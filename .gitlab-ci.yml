@@ -27,7 +27,7 @@ hygiene-check:
     - apk add --no-cache git grep
   script:
     - echo "Scanning for unresolved git conflict markers..."
-    - "! git grep -nE '<<<<<<< HEAD|=======|>>>>>>>' -- ':!*.pdf' ':!*.png' ':!*.jpg' ':!*.mp4' || (echo 'Error: Unresolved conflict markers found' && exit 1)"
+    - "! git grep -I -nE '^<{7} |^={7}$|^>{7} ' || (echo 'Error: Unresolved conflict markers found' && exit 1)"
     - echo "Repository hygiene verification passed."
 
 # ===========================================================================

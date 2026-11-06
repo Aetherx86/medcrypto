@@ -12,14 +12,27 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 )
 
-const prefix = "medcrypto:crypto/api@0.1.0#"
+const (
+	prefix    = "medcrypto:crypto/api@0.2.0#"
+	fhePrefix = "medcrypto:crypto/fhe-ops@0.2.0#"
+)
 
 var errorNames = []string{"bad-length", "authentication-failed", "bad-output-length", "weak-seed"}
+
+var fheErrorNames = []string{"bad-entropy", "bad-encoding", "parameter-mismatch", "value-out-of-range", "scale-mismatch", "out-of-levels"}
+
+// A ciphertext record as it travels: flattened into four arguments going in, and read from memory coming out.
+type ciphertext struct {
+	data   []byte
+	degree uint32
+	scale  float64
+}
 
 // coreModule finds the core module, which is section 1 of a component.
 func coreModule(component []byte) ([]byte, error) {
@@ -50,7 +63,15 @@ type host struct {
 }
 
 func (h *host) call(name string, args ...uint64) uint64 {
-	f := h.mod.ExportedFunction(prefix + name)
+	return h.callExport(prefix+name, args...)
+}
+
+func (h *host) fhe(name string, args ...uint64) uint64 {
+	return h.callExport(fhePrefix+name, args...)
+}
+
+func (h *host) callExport(name string, args ...uint64) uint64 {
+	f := h.mod.ExportedFunction(name)
 	if f == nil {
 		panic("no export " + name)
 	}
@@ -109,6 +130,56 @@ func (h *host) result(ret uint64) ([]byte, string) {
 	}
 	code, _ := h.mod.Memory().ReadByte(uint32(ret + 4))
 	return nil, errorNames[code]
+}
+
+// The record has 8-byte alignment because of its f64, which moves a result's payload to offset 8.
+func (h *host) ciphertextResult(ret uint64) (ciphertext, string) {
+	tag, _ := h.mod.Memory().ReadByte(uint32(ret))
+	if tag != 0 {
+		code, _ := h.mod.Memory().ReadByte(uint32(ret + 8))
+		return ciphertext{}, fheErrorNames[code]
+	}
+	scale, ok := h.mod.Memory().ReadFloat64Le(uint32(ret + 24))
+	if !ok {
+		panic("read out of range")
+	}
+	return ciphertext{h.bytesAt(ret + 8), h.u32(ret + 16), scale}, ""
+}
+
+func (h *host) flatten(c ciphertext) []uint64 {
+	p, n := h.list(c.data)
+	return []uint64{p, n, uint64(c.degree), api.EncodeF64(c.scale)}
+}
+
+func (h *host) floats(values []float64) (uint64, uint64) {
+	p := h.alloc(uint64(len(values))*8, 8)
+	for i, v := range values {
+		h.mod.Memory().WriteFloat64Le(uint32(p)+uint32(i)*8, v)
+	}
+	return p, uint64(len(values))
+}
+
+func (h *host) decrypted(secret []byte, c ciphertext) string {
+	p, n := h.list(secret)
+	ret := h.fhe("decrypt-vector", append([]uint64{p, n}, h.flatten(c)...)...)
+	if tag, _ := h.mod.Memory().ReadByte(uint32(ret)); tag != 0 {
+		panic("decryption failed")
+	}
+	at, count := h.u32(ret+4), h.u32(ret+8)
+	parts := make([]string, count)
+	for i := range parts {
+		v, _ := h.mod.Memory().ReadFloat64Le(at + uint32(i)*8)
+		parts[i] = fmt.Sprintf("%.3f", v)
+	}
+	return strings.Join(parts, " ")
+}
+
+func filled(value byte) []byte {
+	out := make([]byte, 32)
+	for i := range out {
+		out[i] = value
+	}
+	return out
 }
 
 func decode(s string) []byte {
@@ -219,4 +290,54 @@ func main() {
 	fmt.Println("constant-time-equal",
 		boolean(h.call("constant-time-equal", two([]byte("a"), []byte("a"))...)),
 		boolean(h.call("constant-time-equal", two([]byte("a"), []byte("b"))...)))
+
+	p, n = h.list(filled(1))
+	ret = h.fhe("keygen", p, n)
+	if tag, _ := mod.Memory().ReadByte(uint32(ret)); tag != 0 {
+		panic("keygen failed")
+	}
+	fhePublic, fheSecret := h.bytesAt(ret+4), h.bytesAt(ret+12)
+	p, n = h.list(fhePublic)
+	fmt.Println("fhe-public-key", hexOf("sha256", p, n))
+
+	encrypt := func(values []float64, entropy byte) ciphertext {
+		kp, kn := h.list(fhePublic)
+		vp, vn := h.floats(values)
+		ep, en := h.list(filled(entropy))
+		c, e := h.ciphertextResult(h.fhe("encrypt-vector", kp, kn, vp, vn, ep, en))
+		if e != "" {
+			panic(e)
+		}
+		return c
+	}
+	scalar := func(c ciphertext, k float64) (ciphertext, string) {
+		return h.ciphertextResult(h.fhe("homomorphic-scalar-mul", append(h.flatten(c), api.EncodeF64(k))...))
+	}
+	a := encrypt([]float64{120.5, 80.0, 5.75}, 2)
+	b := encrypt([]float64{10.0, 20.0, 0.25}, 3)
+	fmt.Println("fhe-decrypt", h.decrypted(fheSecret, a))
+	sum, e := h.ciphertextResult(h.fhe("homomorphic-add", append(h.flatten(a), h.flatten(b)...)...))
+	if e != "" {
+		panic(e)
+	}
+	fmt.Println("fhe-add", h.decrypted(fheSecret, sum))
+	twice, e := scalar(a, 2.0)
+	if e != "" {
+		panic(e)
+	}
+	fmt.Println("fhe-scalar-mul", h.decrypted(fheSecret, twice))
+	half, e := scalar(a, 0.5)
+	if e != "" {
+		panic(e)
+	}
+	fmt.Println("fhe-scalar-half", h.decrypted(fheSecret, half))
+
+	p, n = h.list(make([]byte, 32))
+	ret = h.fhe("keygen", p, n)
+	code, _ := mod.Memory().ReadByte(uint32(ret + 4))
+	fmt.Println("fhe-bad-entropy", fheErrorNames[code])
+	garbage := a
+	garbage.data = []byte{1, 2, 3}
+	_, e = scalar(garbage, 2.0)
+	fmt.Println("fhe-garbage", e)
 }

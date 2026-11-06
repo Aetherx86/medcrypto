@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Runs the component from Python, with no bindings beyond what the runtime provides."""
+import copy
 import sys
 
 from wasmtime import Engine, Store
 from wasmtime.component import Component, Linker
 
-INTERFACE = "medcrypto:crypto/api@0.1.0"
+API = "medcrypto:crypto/api@0.2.0"
+FHE = "medcrypto:crypto/fhe-ops@0.2.0"
 
 
 class Medcrypto:
@@ -13,10 +15,17 @@ class Medcrypto:
         engine = Engine()
         self.store = Store(engine)
         self.instance = Linker(engine).instantiate(self.store, Component.from_file(engine, path))
-        self.interface = self.instance.get_export_index(self.store, INTERFACE)
+        self.api = self.instance.get_export_index(self.store, API)
+        self.fhe = self.instance.get_export_index(self.store, FHE)
 
     def call(self, name, *args):
-        index = self.instance.get_export_index(self.store, name, self.interface)
+        return self.call_in(self.api, name, *args)
+
+    def fhe_call(self, name, *args):
+        return self.call_in(self.fhe, name, *args)
+
+    def call_in(self, interface, name, *args):
+        index = self.instance.get_export_index(self.store, name, interface)
         func = self.instance.get_func(self.store, index)
         result = func(self.store, *args)
         func.post_return(self.store)
@@ -59,6 +68,21 @@ def main(path):
     print("merkle-root", show(m.call("merkle-root", [b"", h("00"), h("10")])))
     print("audit-link", show(m.call("audit-link", b"ab", b"c")))
     print("constant-time-equal", lower(m.call("constant-time-equal", b"a", b"a")), lower(m.call("constant-time-equal", b"a", b"b")))
+
+    rounded = lambda values: " ".join("%.3f" % v for v in values)
+    pair = m.fhe_call("keygen", bytes([1]) * 32)
+    fhe_public, fhe_secret = bytes(getattr(pair, "public-key")), bytes(getattr(pair, "secret-key"))
+    print("fhe-public-key", show(m.call("sha256", fhe_public)))
+    a = m.fhe_call("encrypt-vector", fhe_public, [120.5, 80.0, 5.75], bytes([2]) * 32)
+    b = m.fhe_call("encrypt-vector", fhe_public, [10.0, 20.0, 0.25], bytes([3]) * 32)
+    print("fhe-decrypt", rounded(m.fhe_call("decrypt-vector", fhe_secret, a)))
+    print("fhe-add", rounded(m.fhe_call("decrypt-vector", fhe_secret, m.fhe_call("homomorphic-add", a, b))))
+    print("fhe-scalar-mul", rounded(m.fhe_call("decrypt-vector", fhe_secret, m.fhe_call("homomorphic-scalar-mul", a, 2.0))))
+    print("fhe-scalar-half", rounded(m.fhe_call("decrypt-vector", fhe_secret, m.fhe_call("homomorphic-scalar-mul", a, 0.5))))
+    print("fhe-bad-entropy", error_name(lambda: m.fhe_call("keygen", bytes(32))))
+    garbage = copy.copy(a)
+    setattr(garbage, "data", b"\x01\x02\x03")
+    print("fhe-garbage", error_name(lambda: m.fhe_call("homomorphic-scalar-mul", garbage, 2.0)))
 
 
 if __name__ == "__main__":

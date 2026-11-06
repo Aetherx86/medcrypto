@@ -1,16 +1,37 @@
 [workspace]
-members = [".", "component"]
+members = [".", "component", "crates/*"]
+
+# The cryptography is far too slow to test unoptimized, and these are the only crates that need it.
+[profile.dev.package.medcrypto-fhe]
+opt-level = 3
+
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
 
 [package]
 name = "medcrypto"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jeong Hoon Kim"]
-description = "Privacy-Preserving Cross-Institutional Healthcare Data Sharing Engine (ZKP + 4th Gen CKKS FHE + Blockchain Audit)"
+description = "Privacy-preserving cross-institutional healthcare data sharing: RNS-CKKS, threshold decryption, range proofs, FHIR ingestion and a consortium daemon"
 license = "MIT"
 readme = "README.md"
 
 [dependencies]
+medcrypto-fhe = { path = "crates/medcrypto-fhe" }
+medcrypto-fhir = { path = "crates/medcrypto-fhir" }
+curve25519-dalek = { version = "4", features = ["digest", "rand_core"] }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+sha3 = "0.10"
+zeroize = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["tls-ring", "transport"] }
+tonic-prost = "0.14"
+prost = "0.14"
+rcgen = "0.14"
+ureq = "3"
+rand_chacha = "0.3"
 ed25519-compact = "2.1"
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -24,6 +45,10 @@ colored = "2.0"
 comfy-table = "7.1"
 aes-gcm = "0.10"
 eframe = "0.29"
+
+[build-dependencies]
+protox = "0.10"
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tempfile = "3.8"

@@ -5,10 +5,9 @@ use medcrypto::zkp::ZKPEngine;
 fn test_hipaa_minimum_necessary_zero_knowledge() {
     let actual_hba1c = 57; // 5.7% (normal)
     let threshold = 65; // 6.5% (diabetic threshold)
-    let blinding = 81726354;
 
     // 1. Prover generates proof
-    let proof = ZKPEngine::prove_threshold(actual_hba1c, blinding, threshold, true)
+    let proof = ZKPEngine::prove_threshold(actual_hba1c, threshold, true)
         .expect("Proof generation should succeed");
 
     // 2. Serialized proof sent to external institution
@@ -26,7 +25,7 @@ fn test_hipaa_minimum_necessary_zero_knowledge() {
 
     // 4. Boundary enforcement: Value outside boundary must fail proof generation
     let diabetic_hba1c = 82; // 8.2%
-    let invalid_attempt = ZKPEngine::prove_threshold(diabetic_hba1c, blinding, threshold, true);
+    let invalid_attempt = ZKPEngine::prove_threshold(diabetic_hba1c, threshold, true);
     assert!(
         invalid_attempt.is_err(),
         "HIPAA Integrity Failure: False predicate was provable"

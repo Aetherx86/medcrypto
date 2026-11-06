@@ -23,21 +23,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Secret Scan (Gitleaks)
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
+
+      - name: Repository Guard
+        run: python3 .github/scripts/repo_guard.py .
 
       - name: Repository Hygiene & Conflict Marker Verification
         run: |
           echo "Scanning for unresolved git conflict markers..."
           ! git grep -I -nE '^<{7} |^={7}$|^>{7} ' || (echo "Error: Unresolved conflict markers found" && exit 1)
           echo "Repository hygiene check completed successfully."
+
+      - name: READMEs have no emoji
+        run: |
+          ! git grep -P -n '[\x{1F300}-\x{1FAFF}\x{2600}-\x{27BF}]' -- README.md README.ko.md CHANGELOG.md || (echo "Error: emoji in documentation" && exit 1)
 
   # ===========================================================================
   # 2. Rust Quality & Test Matrix
@@ -52,18 +60,23 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Set up Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache Cargo Dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@cargo-audit
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+        with:
+          tool: cargo-audit
 
       - name: Rust Formatting Check (cargo fmt)
         run: cargo fmt --all -- --check
@@ -78,4 +91,7 @@ jobs:
         run: cargo audit
 
       - name: Strict Documentation Build (cargo doc)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+
+      - name: The demo runs from start to finish
+        run: cargo run --release --locked -- demo

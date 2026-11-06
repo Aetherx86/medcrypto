@@ -285,9 +285,86 @@ fn the_expected_host_output_is_what_the_cryptography_gives() {
             constant_time_equal(b"a", b"b")
         ),
     ];
+    let expected: Vec<String> = expected.into_iter().chain(expected_fhe_lines()).collect();
     let file = include_str!("../hosts/expected.txt");
     assert_eq!(
         file.lines().collect::<Vec<_>>(),
         expected.iter().map(String::as_str).collect::<Vec<_>>()
     );
+}
+
+/// The hosts' homomorphic steps. Values are rounded, since the noise and the floating-point library differ
+/// from one platform to another. The key has no floating point in it, so its hash is exact everywhere.
+fn expected_fhe_lines() -> Vec<String> {
+    let show = |values: &[f64]| {
+        values
+            .iter()
+            .map(|v| format!("{v:.3}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let (public, secret) = fhe_keygen(&[1; 32]).unwrap();
+    let a = fhe_encrypt(&public, &[120.5, 80.0, 5.75], &[2; 32]).unwrap();
+    let b = fhe_encrypt(&public, &[10.0, 20.0, 0.25], &[3; 32]).unwrap();
+    let mut garbage = a.clone();
+    garbage.data = vec![1, 2, 3];
+    vec![
+        format!("fhe-public-key {}", encode(sha256(&public))),
+        format!("fhe-decrypt {}", show(&fhe_decrypt(&secret, &a).unwrap())),
+        format!(
+            "fhe-add {}",
+            show(&fhe_decrypt(&secret, &fhe_add(&a, &b).unwrap()).unwrap())
+        ),
+        format!(
+            "fhe-scalar-mul {}",
+            show(&fhe_decrypt(&secret, &fhe_scalar_mul(&a, 2.0).unwrap()).unwrap())
+        ),
+        format!(
+            "fhe-scalar-half {}",
+            show(&fhe_decrypt(&secret, &fhe_scalar_mul(&a, 0.5).unwrap()).unwrap())
+        ),
+        "fhe-bad-entropy bad-entropy".to_string(),
+        "fhe-garbage bad-encoding".to_string(),
+    ]
+}
+
+#[test]
+fn homomorphic_operations_refuse_bad_input() {
+    assert_eq!(fhe_keygen(&[0; 32]), Err(FheOpError::BadEntropy));
+    assert_eq!(fhe_keygen(&[1; 31]), Err(FheOpError::BadEntropy));
+    let (public, secret) = fhe_keygen(&[1; 32]).unwrap();
+    assert_eq!(
+        fhe_encrypt(&[1, 2], &[1.0], &[2; 32]),
+        Err(FheOpError::BadEncoding)
+    );
+    assert_eq!(
+        fhe_encrypt(&public, &[f64::NAN], &[2; 32]),
+        Err(FheOpError::ValueOutOfRange)
+    );
+    assert_eq!(
+        fhe_encrypt(&public, &vec![0.0; 4097], &[2; 32]),
+        Err(FheOpError::ValueOutOfRange)
+    );
+
+    let a = fhe_encrypt(&public, &[1.0, 2.0], &[2; 32]).unwrap();
+    let mut wrong_scale = a.clone();
+    wrong_scale.scale = 2.0;
+    assert_eq!(
+        fhe_decrypt(&secret, &wrong_scale),
+        Err(FheOpError::BadEncoding)
+    );
+
+    // A fraction drops a level, so adding that to a fresh ciphertext is refused.
+    let half = fhe_scalar_mul(&a, 0.5).unwrap();
+    assert_eq!(fhe_add(&a, &half), Err(FheOpError::ScaleMismatch));
+
+    // The two levels of this preset can be spent on fractions, and then there are none left.
+    let quarter = fhe_scalar_mul(&half, 0.5).unwrap();
+    assert_eq!(fhe_scalar_mul(&quarter, 0.5), Err(FheOpError::OutOfLevels));
+    let values = fhe_decrypt(&secret, &quarter).unwrap();
+    assert!((values[1] - 0.5).abs() < 1e-3);
+
+    // Different entropy gives a different ciphertext for the same values.
+    let other = fhe_encrypt(&public, &[1.0, 2.0], &[9; 32]).unwrap();
+    assert_ne!(a.data, other.data);
 }

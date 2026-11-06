@@ -254,7 +254,7 @@ impl eframe::App for MedCryptoApp {
         // Bottom Status Bar
         egui::TopBottomPanel::bottom("bottom_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Cryptographic Primitives: Ring-LWE CKKS (N=128, q=30-bit)  |  SHA-256 Merkle Chain  |  Pedersen Fiat-Shamir");
+                ui.label("Cryptographic Primitives: RNS-CKKS (N=8192, 200-bit QP)  |  SHA-256 Merkle Chain  |  Pedersen Range Proofs");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label("Jeong Hoon Kim");
                 });
@@ -286,7 +286,7 @@ impl MedCryptoApp {
             ui.strong("Core Technology Triad Status:");
             ui.label("- Blockchain: Consortium L2 settlement layer for W3C DID, Dynamic Consent, and Zero-PHI state roots.");
             ui.label("- Zero-Knowledge Proofs: Proving compliance and eligibility predicates without exposing clinical measurements.");
-            ui.label("- 4th Generation FHE (CKKS): Computing federated statistics on encrypted vectors over Ring-LWE lattices.");
+            ui.label("- RNS-CKKS homomorphic encryption: computing federated statistics on encrypted vectors over Ring-LWE lattices.");
             ui.label("- Post-Quantum Security: Immune to Shor's algorithm; Grover 128-bit quantum resistance for hash chains.");
         });
 
@@ -349,7 +349,7 @@ impl MedCryptoApp {
     }
 
     fn render_patient_encryption(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Patient Clinical Vitals & 4th Generation CKKS Encryption");
+        ui.heading("Patient Clinical Vitals & RNS-CKKS Encryption");
         ui.label("Continuous numerical biological data is encrypted into Ring-LWE polynomial ciphertexts.");
         ui.add_space(10.0);
 
@@ -390,13 +390,21 @@ impl MedCryptoApp {
                         self.fasting_glucose,
                         self.systolic_bp,
                     );
-                    let ct = self
+                    match self
                         .fhe_engine
-                        .encrypt(&self.public_key, &record.to_vector());
-                    self.current_ciphertext = Some(ct);
-                    self.encryption_status_msg =
-                        "Successfully encrypted 8 clinical dimensions into CKKS ciphertext."
-                            .to_string();
+                        .encrypt(&self.public_key, &record.to_vector())
+                    {
+                        Ok(ct) => {
+                            self.current_ciphertext = Some(ct);
+                            self.encryption_status_msg =
+                                "Encrypted 8 clinical dimensions into a CKKS ciphertext."
+                                    .to_string();
+                        }
+                        Err(e) => {
+                            self.current_ciphertext = None;
+                            self.encryption_status_msg = format!("Encryption failed: {e}");
+                        }
+                    }
                 }
             });
 
@@ -406,21 +414,27 @@ impl MedCryptoApp {
                 if let Some(ct) = &self.current_ciphertext {
                     ui.label(format!("Scale Factor (Delta): {:.0}", ct.scale));
                     ui.label(format!("Packed Slots: {}", ct.num_slots));
-                    ui.label(format!("Polynomial Degree: N={}", ct.c0.degree()));
-                    ui.label(format!("Ciphertext Modulus: q={}", ct.c0.modulus));
+                    ui.label(format!("Polynomial Degree: N={}", ct.polys[0].degree()));
                     ui.label(format!(
-                        "First 4 coefficients c0: {:?}",
-                        &ct.c0.coeffs[0..4]
+                        "RNS Primes in Use: {} (level {})",
+                        ct.polys[0].limb_count(),
+                        ct.level()
                     ));
                     ui.label(format!(
-                        "First 4 coefficients c1: {:?}",
-                        &ct.c1.coeffs[0..4]
+                        "First 4 residues of c0: {:?}",
+                        ct.polys[0].preview(4)
+                    ));
+                    ui.label(format!(
+                        "First 4 residues of c1: {:?}",
+                        ct.polys[1].preview(4)
                     ));
 
                     ui.add_space(8.0);
                     if ui.button("Test Decrypt (Secret Key)").clicked() {
-                        let dec = self.fhe_engine.decrypt(&self.secret_key, ct);
-                        ui.label(format!("Decrypted Vitals Vector: {:?}", dec));
+                        match self.fhe_engine.decrypt(&self.secret_key, ct) {
+                            Ok(dec) => ui.label(format!("Decrypted Vitals Vector: {:?}", dec)),
+                            Err(e) => ui.label(format!("Decryption failed: {e}")),
+                        };
                     }
                 } else {
                     ui.label("No active ciphertext generated yet.");
@@ -448,10 +462,8 @@ impl MedCryptoApp {
                 .button("Generate Zero-Knowledge Proof (Fiat-Shamir)")
                 .clicked()
             {
-                let blinding = ZKPEngine::random_blinding();
                 match ZKPEngine::prove_threshold(
                     self.zkp_metric_value,
-                    blinding,
                     self.zkp_threshold,
                     self.zkp_is_upper_bound,
                 ) {
@@ -475,9 +487,9 @@ impl MedCryptoApp {
             ui.label(format!("Status: {}", self.zkp_status_msg));
 
             if let Some(proof) = &self.latest_zkp_proof {
-                ui.label(format!("Commitment C: {}", proof.commitment));
-                ui.label(format!("Announcement R: {}", proof.announcement));
-                ui.label(format!("Challenge c: {}", proof.challenge));
+                ui.label(format!("Commitment C: {}", proof.commitment()));
+                ui.label(format!("Proof Backend: {}", proof.proof.backend));
+                ui.label(format!("Proof Size: {} bytes", proof.proof.payload.len() / 2));
                 ui.label(format!("Proof Hash: 0x{}", proof.proof_hash));
 
                 ui.add_space(6.0);
@@ -511,17 +523,24 @@ impl MedCryptoApp {
 
             ui.add_space(8.0);
             if ui.button("Run Homomorphic Federated Average (Untrusted Cloud)").clicked() {
-                let ct_a = self.fhe_engine.encrypt(&self.public_key, &[self.hosp_a_glucose]);
-                let ct_b = self.fhe_engine.encrypt(&self.public_key, &[self.hosp_b_glucose]);
-                let ct_c = self.fhe_engine.encrypt(&self.public_key, &[self.hosp_c_glucose]);
-
-                // Untrusted cloud computes average on ciphertext directly
-                let ct_avg = self.fhe_engine.federated_average(&[ct_a, ct_b, ct_c]);
-
-                // Decrypt aggregate only
-                let decrypted = self.fhe_engine.decrypt(&self.secret_key, &ct_avg);
-                self.federated_result = Some(decrypted);
-                self.federated_status_msg = "Federated computation completed without decrypting individual hospital inputs.".to_string();
+                let engine = &self.fhe_engine;
+                let outcome = [self.hosp_a_glucose, self.hosp_b_glucose, self.hosp_c_glucose]
+                    .iter()
+                    .map(|v| engine.encrypt(&self.public_key, &[*v]))
+                    .collect::<Result<Vec<_>, _>>()
+                    // The cloud computes the average on ciphertexts, and only the aggregate is decrypted.
+                    .and_then(|cts| engine.federated_average(&cts))
+                    .and_then(|average| engine.decrypt(&self.secret_key, &average));
+                match outcome {
+                    Ok(decrypted) => {
+                        self.federated_result = Some(decrypted);
+                        self.federated_status_msg = "Federated computation completed without decrypting individual hospital inputs.".to_string();
+                    }
+                    Err(e) => {
+                        self.federated_result = None;
+                        self.federated_status_msg = format!("Federated computation failed: {e}");
+                    }
+                }
             }
         });
 
@@ -638,7 +657,7 @@ impl MedCryptoApp {
         ui.label("Evaluates the lattice hardness against Shor's and Grover's quantum algorithms.");
         ui.add_space(10.0);
 
-        let report = QuantumAuditor::evaluate_rlwe_security(128, 1_073_741_789, 3.2);
+        let report = QuantumAuditor::evaluate_context(self.fhe_engine.context());
 
         ui.group(|ui| {
             egui::Grid::new("pqc_grid").striped(true).show(ui, |ui| {
@@ -654,8 +673,8 @@ impl MedCryptoApp {
                 ui.strong(report.ring_dimension_n.to_string());
                 ui.end_row();
 
-                ui.label("Modulus Bit Length (q):");
-                ui.strong(format!("{} bits", report.modulus_bits_q));
+                ui.label("Total Modulus Size (QP):");
+                ui.strong(format!("{} bits", report.modulus_bits_qp));
                 ui.end_row();
 
                 ui.label("Shor's Algorithm Immunity:");
@@ -666,12 +685,16 @@ impl MedCryptoApp {
                 ui.strong(format!("{} bits", report.grover_security_bits));
                 ui.end_row();
 
-                ui.label("Quantum Sieving (BKZ/BDGL):");
-                ui.strong(format!("~{} bits", report.quantum_sieving_security_bits));
+                ui.label("HE Standard Limit (Quantum, 128 bits):");
+                ui.strong(
+                    report
+                        .limit_bits_quantum_128
+                        .map_or("not covered".to_string(), |l| format!("{l} bits")),
+                );
                 ui.end_row();
 
-                ui.label("NIST Security Level:");
-                ui.strong(&report.nist_security_level);
+                ui.label("Assessment:");
+                ui.strong(&report.security_assessment);
                 ui.end_row();
             });
         });
@@ -691,7 +714,7 @@ impl MedCryptoApp {
         ui.add_space(8.0);
 
         ui.group(|ui| {
-            ui.strong("Longitudinal EHR Trajectory (Patient MIMIC-III Benchmark Profile):");
+            ui.strong("Longitudinal EHR Trajectory (Hand-Written Sample Patient):");
             egui::Grid::new("clinical_trajectory_grid")
                 .striped(true)
                 .show(ui, |ui| {

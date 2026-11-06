@@ -1,5 +1,5 @@
 // Runs the component from JavaScript, through the module that jco generates from it.
-import { api } from "./generated/medcrypto.js";
+import { api, fheOps } from "./generated/medcrypto.js";
 
 const h = (text) => Uint8Array.from(Buffer.from(text, "hex"));
 const show = (bytes) => Buffer.from(bytes).toString("hex");
@@ -37,3 +37,15 @@ console.log("verify-wrong-message", api.verify(pair.publicKey, text("x"), signat
 console.log("merkle-root", show(api.merkleRoot([none, h("00"), h("10")])));
 console.log("audit-link", show(api.auditLink(text("ab"), text("c"))));
 console.log("constant-time-equal", api.constantTimeEqual(text("a"), text("a")), api.constantTimeEqual(text("a"), text("b")));
+
+const rounded = (values) => Array.from(values, (v) => v.toFixed(3)).join(" ");
+const fhe = fheOps.keygen(new Uint8Array(32).fill(1));
+console.log("fhe-public-key", show(api.sha256(fhe.publicKey)));
+const a = fheOps.encryptVector(fhe.publicKey, Float64Array.of(120.5, 80.0, 5.75), new Uint8Array(32).fill(2));
+const b = fheOps.encryptVector(fhe.publicKey, Float64Array.of(10.0, 20.0, 0.25), new Uint8Array(32).fill(3));
+console.log("fhe-decrypt", rounded(fheOps.decryptVector(fhe.secretKey, a)));
+console.log("fhe-add", rounded(fheOps.decryptVector(fhe.secretKey, fheOps.homomorphicAdd(a, b))));
+console.log("fhe-scalar-mul", rounded(fheOps.decryptVector(fhe.secretKey, fheOps.homomorphicScalarMul(a, 2.0))));
+console.log("fhe-scalar-half", rounded(fheOps.decryptVector(fhe.secretKey, fheOps.homomorphicScalarMul(a, 0.5))));
+console.log("fhe-bad-entropy", errorName(() => fheOps.keygen(new Uint8Array(32))));
+console.log("fhe-garbage", errorName(() => fheOps.homomorphicScalarMul({ ...a, data: Uint8Array.of(1, 2, 3) }, 2.0)));
