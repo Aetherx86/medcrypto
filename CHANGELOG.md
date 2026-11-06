@@ -3,6 +3,11 @@
 Versions follow this rule: a bug or security fix increments `0.0.X`, and new functionality or new platform
 support increments `0.X.0`.
 
+## 0.2.2
+
+- License: from proprietary to Creative Commons Attribution-NoDerivatives 4.0 International (CC BY-ND 4.0), from this version on.
+- 라이선스: 이 버전부터 독점 라이선스에서 크리에이티브 커먼즈 저작자표시-변경금지 4.0 국제 라이선스(CC BY-ND 4.0)로 변경했습니다.
+
 ## 0.2.1
 
 - License: from MIT to proprietary. Only Jeong Hoon Kim may use this software, from this version on. Copies of 0.2.0 and

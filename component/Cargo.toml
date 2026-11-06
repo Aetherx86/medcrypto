@@ -1,10 +1,10 @@
 [package]
 name = "medcrypto-component"
 description = "MedCrypto's core cryptography and homomorphic encryption as a WebAssembly Component with no imports"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["Jeong Hoon Kim"]
-license-file = "../LICENSE"
+license = "CC-BY-ND-4.0"
 publish = false
 
 [lib]

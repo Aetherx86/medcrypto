@@ -128,7 +128,7 @@ cargo build --release
 Linux x86-64와 macOS ARM용 빌드는 각 [릴리스](https://github.com/Aetherx86/medcrypto/releases/latest)에 체크섬, 빌드 출처 증명과 함께
 첨부됩니다.
 
-**라이선스.** 이 소프트웨어는 독점 소프트웨어이며 저작자만 사용할 수 있습니다. [LICENSE](LICENSE)를 참고하세요. `medcrypto` 바이너리는 시작할 때
+**라이선스.** 이 저작물은 [CC BY-ND 4.0](LICENSE)을 따릅니다. 저작자를 표시하면 공유할 수 있고, 변경한 버전은 배포할 수 없습니다. `medcrypto` 바이너리는 시작할 때
 `AETHER_LICENSE_KEY` 또는 `~/.aether/license.key`에서 Ed25519로 서명된 라이선스 토큰도 찾으며, 없으면 종료합니다.
 
 먼저 합성 데이터로 전체 흐름을 보려면 다음을 실행합니다.
@@ -1323,5 +1323,5 @@ cargo test --workspace --all-targets --all-features
 
 ## 27. 라이선스
 
-독점 소프트웨어. Copyright (c) 2026 Jeong Hoon Kim, 모든 권리 보유. 저작자만 사용할 수 있습니다. [LICENSE](LICENSE)와
-[LEGAL.md](LEGAL.md)를 참고하세요.
+[크리에이티브 커먼즈 저작자표시-변경금지 4.0 국제 라이선스(CC BY-ND 4.0)](https://creativecommons.org/licenses/by-nd/4.0/deed.ko).
+Copyright (c) 2026 Jeong Hoon Kim. [LICENSE](LICENSE)와 [LEGAL.md](LEGAL.md)를 참고하세요.

@@ -133,8 +133,8 @@ cargo build --release
 Prebuilt archives for Linux x86-64 and macOS ARM are attached to each
 [release](https://github.com/Aetherx86/medcrypto/releases/latest), with checksums and build provenance.
 
-**License.** This software is proprietary, and only its author may use it: see [LICENSE](LICENSE). The `medcrypto` binary also
-looks for an Ed25519-signed license token at startup, in `AETHER_LICENSE_KEY` or `~/.aether/license.key`, and exits if there is
+**License.** This work is under [CC BY-ND 4.0](LICENSE): it may be shared with attribution, and modified versions may not be
+distributed. The `medcrypto` binary also looks for an Ed25519-signed license token at startup, in `AETHER_LICENSE_KEY` or `~/.aether/license.key`, and exits if there is
 none.
 
 To see the whole flow on synthetic data first:
@@ -1405,5 +1405,5 @@ with an HSM or KMS; and resharing for changing membership.
 
 ## 27. License
 
-Proprietary. Copyright (c) 2026 Jeong Hoon Kim, all rights reserved. Only the author may use this software. See
-[LICENSE](LICENSE) and [LEGAL.md](LEGAL.md).
+[Creative Commons Attribution-NoDerivatives 4.0 International (CC BY-ND 4.0)](https://creativecommons.org/licenses/by-nd/4.0/).
+Copyright (c) 2026 Jeong Hoon Kim. See [LICENSE](LICENSE) and [LEGAL.md](LEGAL.md).

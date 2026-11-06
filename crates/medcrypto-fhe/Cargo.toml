@@ -1,9 +1,9 @@
 [package]
 name = "medcrypto-fhe"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["Jeong Hoon Kim"]
-license-file = "../../LICENSE"
+license = "CC-BY-ND-4.0"
 description = "RNS-CKKS homomorphic encryption with relinearization, rescaling, Galois rotations and k-of-n threshold decryption"
 publish = false
 
