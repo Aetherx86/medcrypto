@@ -1,6 +1,9 @@
+[workspace]
+members = [".", "component"]
+
 [package]
 name = "medcrypto"
-version = "0.0.1-beta"
+version = "0.1.0"
 edition = "2021"
 authors = ["Jeong Hoon Kim"]
 description = "Privacy-Preserving Cross-Institutional Healthcare Data Sharing Engine (ZKP + 4th Gen CKKS FHE + Blockchain Audit)"

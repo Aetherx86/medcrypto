@@ -1,4 +1,4 @@
-# MedCrypto (v0.0.1-beta)
+# MedCrypto (v0.1.0)
 
 Privacy-Preserving Cross-Institutional Healthcare Data Sharing Engine.
 
@@ -20,6 +20,42 @@ The system integrates four complementary technologies:
 | GDPR Article 25 | Privacy by Design | Exposure of patient records during processing | In-hospital encryption boundary: Clinical records are converted into CKKS ciphertexts and ZKP commitments before leaving the hospital intranet. No plaintext crosses organizational perimeters. |
 | HIPAA Section 164.502(b) | Minimum Necessary Rule | Disclosing full medical records for single-variable checks | Zero-Knowledge Range & Predicate Proofs: Proves specific conditions (e.g., HbA1c <= 6.5% or Age >= 18) as a boolean mathematical verification truth without revealing the patient's actual lab measurements. |
 | HIPAA Section 164.528 | Accounting of Disclosures | Tampering or loss of access history logs | Chained Tamper-Proof Audit Ledger: Every access request, purpose code, ZKP verification, and FHE query is appended to a cryptographic hash chain. Any modification to past entries breaks verification integrity. |
+
+---
+
+## Wasm Component: one binary, any language
+
+`component/` packages MedCrypto's core cryptography as a [WebAssembly Component](https://component-model.bytecodealliance.org/). There is one `medcrypto.wasm`, attached to each [release](https://github.com/Aetherx86/medcrypto/releases/latest), and its interface is defined in [`component/wit/medcrypto.wit`](component/wit/medcrypto.wit). No language-specific C bindings are involved.
+
+| Function | What it is | Checked against |
+| :--- | :--- | :--- |
+| `sha256` | SHA-256 | FIPS 180 |
+| `hkdf` | HKDF-SHA-256 key derivation | RFC 5869 |
+| `seal`, `open` | AES-256-GCM authenticated encryption | NIST vectors |
+| `keypair-from-seed`, `sign`, `verify` | Ed25519 signatures | RFC 8032 |
+| `merkle-root` | Merkle tree with separate leaf and node hashes | RFC 6962 reference data |
+| `audit-link` | One link of a tamper-evident audit chain | Own tests |
+| `constant-time-equal` | Comparison whose time does not depend on the contents | Own tests |
+
+**It imports nothing.** The component has no file, clock, network or random access, which CI checks on every build, so whatever a bug in it could do is limited to computing a wrong answer. Because of that, randomness has to come from the caller. Pass `keypair-from-seed` 32 bytes, and `seal` a 12-byte nonce, from your platform's cryptographic random source, and never reuse a nonce with a key. A seed of all zeros is refused, since that is what a broken random source tends to produce.
+
+The hosts in `component/hosts/` each run the same file and have to print exactly [`expected.txt`](component/hosts/expected.txt), and a native test checks that file against the Rust code:
+
+```bash
+sh component/build.sh     # needs the wasm32-unknown-unknown target and wasm-tools
+
+# Python
+pip install -r component/hosts/python/requirements.txt
+python component/hosts/python/run.py component/dist/medcrypto.wasm
+
+# TypeScript
+cd component/hosts/typescript && npm ci --ignore-scripts && npm run transpile && node run.mjs
+
+# Go
+cd component/hosts/go && go run . ../../dist/medcrypto.wasm
+```
+
+Python and TypeScript use real component runtimes (`wasmtime` and `jco`). Go has no mature one yet, so the Go host uses `wazero` to run the core module inside the component file, and handles the Canonical ABI by hand. That is the same compiled code, but it is more work than the others, and it only works this simply because the component has no imports.
 
 ---
 

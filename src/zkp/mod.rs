@@ -74,6 +74,15 @@ pub struct ClinicalEligibilityProof {
 pub struct ZKPEngine;
 
 impl ZKPEngine {
+    /// A blinding factor from the operating system's random source, across the whole range.
+    ///
+    /// This must be fresh for every commitment. A commitment hides a small value like a lab reading only
+    /// because the blinding is unknown. With a fixed one, anybody can try each possible value and see
+    /// which gives the same commitment.
+    pub fn random_blinding() -> u64 {
+        rand::rngs::OsRng.gen_range(1..PRIME_P - 1)
+    }
+
     /// Generates a Zero-Knowledge Proof that v satisfies threshold (v <= threshold OR v >= threshold)
     pub fn prove_threshold(
         value: u64,
@@ -223,6 +232,31 @@ mod tests {
         let age_blinding: u64 = rng.gen_range(1000..999999);
         let age_proof = ZKPEngine::prove_threshold(actual_age, age_blinding, 18, false).unwrap();
         assert!(ZKPEngine::verify_threshold(&age_proof));
+    }
+
+    #[test]
+    fn test_blinding_is_fresh_and_hides_a_small_value() {
+        let (first, second) = (ZKPEngine::random_blinding(), ZKPEngine::random_blinding());
+        assert_ne!(first, second);
+        let commitment = PedersenCommitment::commit(58, first).commitment;
+        assert_ne!(
+            commitment,
+            PedersenCommitment::commit(58, second).commitment
+        );
+        // Guessing the value under a different blinding does not reproduce the commitment.
+        for guess in 0..200 {
+            assert_ne!(
+                PedersenCommitment::commit(guess, second).commitment,
+                commitment,
+                "guess {guess}"
+            );
+        }
+        // A proof with blinding from the whole range still verifies.
+        for _ in 0..50 {
+            let proof =
+                ZKPEngine::prove_threshold(58, ZKPEngine::random_blinding(), 65, true).unwrap();
+            assert!(ZKPEngine::verify_threshold(&proof));
+        }
     }
 
     #[test]

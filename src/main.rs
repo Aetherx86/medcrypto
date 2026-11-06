@@ -175,7 +175,7 @@ fn main() {
             upper_bound,
             output,
         }) => {
-            let blinding = 987654321;
+            let blinding = ZKPEngine::random_blinding();
             match ZKPEngine::prove_threshold(value, blinding, threshold, upper_bound) {
                 Ok(proof) => {
                     println!(
@@ -435,7 +435,7 @@ fn run_interactive_demo() {
         "  * Goal: Prove HbA1c <= 6.5% WITHOUT revealing the exact value (5.9%) to Hospital B"
     );
     let scaled_hba1c = (patient_data.hba1c * 10.0).round() as u64; // 59
-    let blinding = 482710395;
+    let blinding = ZKPEngine::random_blinding();
     let zk_proof = ZKPEngine::prove_threshold(scaled_hba1c, blinding, 65, true).unwrap();
     println!(
         "  * ZKP Generated: Announcement R={}, Challenge c={}",

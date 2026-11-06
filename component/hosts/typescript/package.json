@@ -1,0 +1,12 @@
+{
+  "name": "medcrypto-host-typescript",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "transpile": "jco transpile ../../dist/medcrypto.wasm -o generated --no-typescript",
+    "start": "node run.mjs"
+  },
+  "devDependencies": {
+    "@bytecodealliance/jco": "1.15.0"
+  }
+}

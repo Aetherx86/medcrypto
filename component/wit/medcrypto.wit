@@ -1,0 +1,57 @@
+package medcrypto:crypto@0.1.0;
+
+/// Cryptography with no ambient authority. This component imports nothing, so it cannot read a clock, a
+/// file, a socket or a random source. Anything that needs randomness takes it from the caller.
+interface api {
+    enum crypto-error {
+        /// A key, nonce, seed or signature has the wrong length.
+        bad-length,
+        /// The ciphertext, its tag or its associated data has been altered, or the key is wrong.
+        authentication-failed,
+        /// An output length that the function cannot produce.
+        bad-output-length,
+        /// A seed of all zeros, which is what a broken random source tends to produce.
+        weak-seed,
+    }
+
+    record keypair {
+        public-key: list<u8>,
+        secret-key: list<u8>,
+    }
+
+    /// SHA-256 of the data.
+    sha256: func(data: list<u8>) -> list<u8>;
+
+    /// HKDF-SHA-256 from RFC 5869. The length can be at most 8160 bytes.
+    hkdf: func(input-key: list<u8>, salt: list<u8>, info: list<u8>, length: u32) -> result<list<u8>, crypto-error>;
+
+    /// AES-256-GCM. The key is 32 bytes and the nonce is 12, and a nonce must never repeat under one key,
+    /// so pass 12 bytes from a cryptographic random source each time. The result ends with the 16-byte tag.
+    seal: func(key: list<u8>, nonce: list<u8>, associated-data: list<u8>, plaintext: list<u8>) -> result<list<u8>, crypto-error>;
+
+    /// Reverses `seal`, and only returns anything if the authentication tag holds.
+    open: func(key: list<u8>, nonce: list<u8>, associated-data: list<u8>, ciphertext: list<u8>) -> result<list<u8>, crypto-error>;
+
+    /// An Ed25519 keypair from a 32-byte seed, which has to come from a cryptographic random source.
+    keypair-from-seed: func(seed: list<u8>) -> result<keypair, crypto-error>;
+
+    /// An Ed25519 signature, from RFC 8032. It is deterministic, so it needs no randomness.
+    sign: func(secret-key: list<u8>, message: list<u8>) -> result<list<u8>, crypto-error>;
+
+    /// Whether a signature is valid. Anything malformed is simply not valid.
+    verify: func(public-key: list<u8>, message: list<u8>, signature: list<u8>) -> bool;
+
+    /// The Merkle tree root from RFC 6962, with separate leaf and node hashes, so that a node cannot be
+    /// passed off as a leaf.
+    merkle-root: func(leaves: list<list<u8>>) -> list<u8>;
+
+    /// One link of a tamper-evident audit chain: the hash of the previous link and this entry.
+    audit-link: func(previous: list<u8>, entry: list<u8>) -> list<u8>;
+
+    /// Compares two values in time that does not depend on where they differ.
+    constant-time-equal: func(a: list<u8>, b: list<u8>) -> bool;
+}
+
+world medcrypto {
+    export api;
+}

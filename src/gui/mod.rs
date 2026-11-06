@@ -448,7 +448,7 @@ impl MedCryptoApp {
                 .button("Generate Zero-Knowledge Proof (Fiat-Shamir)")
                 .clicked()
             {
-                let blinding = 99887766;
+                let blinding = ZKPEngine::random_blinding();
                 match ZKPEngine::prove_threshold(
                     self.zkp_metric_value,
                     blinding,
