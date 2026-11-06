@@ -11,6 +11,8 @@ use medcrypto::quantum::QuantumAuditor;
 use medcrypto::zkp::ZKPEngine;
 use std::fs;
 
+mod license;
+
 #[derive(Parser)]
 #[command(name = "medcrypto")]
 #[command(author = "Jeong Hoon Kim")]
@@ -84,6 +86,7 @@ enum Commands {
 }
 
 fn main() {
+    license::enforce_license_or_exit("medcrypto");
     let cli = Cli::parse();
 
     match cli.command {
