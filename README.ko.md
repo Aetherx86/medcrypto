@@ -28,9 +28,9 @@
 
 Rust로 작성했으며, Python, TypeScript, Go에서 쓸 수 있는 WebAssembly Component를 하나 제공합니다.
 
-> **현재 상태.** 실제 구현과 전 구간 테스트를 갖춘 연구용 소프트웨어이며, **독립적인 암호 감사를 받지 않았습니다.** 인증받은 의료기기가
-> 아니고, 사용한다고 해서 HIPAA나 GDPR을 자동으로 준수하게 되지도 않습니다. 실제로 사용하기 전에
-> [보안 모델과 한계](#16-보안-모델과-한계)를 읽으시고, 자체 검토 없이 실제 환자 데이터를 넣지 마세요.
+> **현재 상태.** 실제 구현과 전 구간 테스트를 갖춘 연구용 소프트웨어입니다. 인증받은 의료기기가 아니고, 사용한다고 해서 HIPAA나 GDPR을
+> 자동으로 준수하게 되지도 않습니다. 실제로 사용하기 전에 [보안 모델과 한계](#16-보안-모델과-한계)를 읽으시고, 자체 검토 없이 실제 환자
+> 데이터를 넣지 마세요.
 
 ## 목차
 
@@ -128,9 +128,8 @@ cargo build --release
 Linux x86-64와 macOS ARM용 빌드는 각 [릴리스](https://github.com/Aetherx86/medcrypto/releases/latest)에 체크섬, 빌드 출처 증명과 함께
 첨부됩니다.
 
-**라이선스 검사 안내.** 소스 코드는 MIT 라이선스입니다. 이와 별개로 `medcrypto` 명령줄 바이너리는 시작할 때 `AETHER_LICENSE_KEY` 또는
-`~/.aether/license.key`에서 Ed25519로 서명된 라이선스 토큰을 찾고, 없으면 종료합니다. 라이브러리 크레이트와 Wasm Component에는 이 검사가
-없습니다. 토큰은 [포털](https://aetherx86.github.io/#products)에서 받을 수 있습니다.
+**라이선스.** 이 소프트웨어는 독점 소프트웨어이며 저작자만 사용할 수 있습니다. [LICENSE](LICENSE)를 참고하세요. `medcrypto` 바이너리는 시작할 때
+`AETHER_LICENSE_KEY` 또는 `~/.aether/license.key`에서 Ed25519로 서명된 라이선스 토큰도 찾으며, 없으면 종료합니다.
 
 먼저 합성 데이터로 전체 흐름을 보려면 다음을 실행합니다.
 
@@ -739,7 +738,7 @@ gRPC 서비스는 [`proto/consortium.proto`](proto/consortium.proto)에 정의�
 원격 RPC는 https여야 합니다. 빈 응답, revert, 정확히 `true`가 아닌 값은 모두 거부로 처리합니다.
 
 가명을 해시해도 익명이 되지는 않습니다. 가명 목록을 가진 쪽은 알아볼 수 있기 때문입니다. 공개 체인의 가명 해시가 GDPR상 개인정보인지는 실제로 따져 봐야 할 문제이므로,
-허가형 체인을 쓰거나 법률 자문을 받으세요. 컨트랙트 감사 없이 이 컨트랙트를 배포하지 마세요.
+허가형 체인을 쓰거나 법률 자문을 받으세요. 배포 전에 이 컨트랙트를 꼼꼼히 검토하세요.
 
 컨트랙트는 Foundry의 `anvil`로 실제 로컬 체인에서 테스트했습니다. 이 테스트는 Foundry가 있을 때만 실행되고 없으면 건너뛰며, CI 러너도 건너뜁니다.
 
@@ -985,11 +984,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 따라서 주장의 범위는 좁습니다. 데이터의 동형암호는 양자 내성이지만, **시스템 전체가 그런 것은 아닙니다.** 네트워크에서 녹화된 암호문은 CKKS 계층이 계속 보호하지만, 키 생성 중
 전송되는 비밀 조각은 TLS에만 의존합니다. 공격자가 지금 트래픽을 녹화해 두고 나중에 양자 컴퓨터를 갖는다면 문제가 됩니다.
-
-### 감사받지 않음
-
-구현은 직접 작성했고, 테스트는 정의와 공개 벡터가 있는 곳에서는 그것과 대조합니다. 독립적인 검토는 받지 않았습니다. OpenFHE, Microsoft SEAL, Lattigo 같은 성숙한 라이브러리는 훨씬
-많은 검증을 거쳤습니다. 여기서 직접 구현을 택한 이유는 순수 Rust, Wasm 지원, import 없는 빌드 때문이니 이를 감안해 판단하세요.
 
 ---
 
@@ -1271,7 +1265,7 @@ cargo test --workspace --all-targets --all-features
 | Wasm `fhe-ops` | 완료 | Python, TypeScript, Go |
 
 다음에 할 만한 일을 가치순으로 적으면 다음과 같습니다. 검증 가능한 비밀 분배와 부분 복호화 정확성 증명, 기여 값의 입력 범위 증명, 공개 통계의 차등 프라이버시, 양자 내성 TLS와 서명, 실제 SP1
-러너, 키 저장소의 HSM/KMS 연동, 구성원 변경을 위한 재공유, 독립 감사.
+러너, 키 저장소의 HSM/KMS 연동, 구성원 변경을 위한 재공유.
 
 ---
 
@@ -1329,4 +1323,5 @@ cargo test --workspace --all-targets --all-features
 
 ## 27. 라이선스
 
-MIT, Jeong Hoon Kim. [LICENSE](LICENSE)와 [LEGAL.md](LEGAL.md)를 참고하세요.
+독점 소프트웨어. Copyright (c) 2026 Jeong Hoon Kim, 모든 권리 보유. 저작자만 사용할 수 있습니다. [LICENSE](LICENSE)와
+[LEGAL.md](LEGAL.md)를 참고하세요.

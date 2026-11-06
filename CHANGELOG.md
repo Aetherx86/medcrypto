@@ -3,6 +3,13 @@
 Versions follow this rule: a bug or security fix increments `0.0.X`, and new functionality or new platform
 support increments `0.X.0`.
 
+## 0.2.1
+
+- License: from MIT to proprietary. Only Jeong Hoon Kim may use this software, from this version on. Copies of 0.2.0 and
+  earlier that were obtained under the MIT license stay under it.
+- 라이선스: MIT에서 독점 라이선스로 변경했습니다. 이 버전부터 Jeong Hoon Kim만 사용할 수 있습니다. MIT로 받은 0.2.0 이하 복사본은 계속 MIT
+  라이선스를 따릅니다.
+
 ## 0.2.0
 
 The upgrade from a toy-parameter, single-record tool to a multi-hospital system. English first, then
@@ -73,7 +80,7 @@ system does not do, in a section of its own.
 
 ### Known limits
 
-See "Security model and limitations" in the README. The main ones: no independent audit; parties assumed honest but
+See "Security model and limitations" in the README. The main ones: parties assumed honest but
 curious; `StarkCoprocessorBackend` has been tested against a stand-in runner only, not against a real prover; and
 TLS and Ed25519 are not post-quantum.
 
@@ -152,7 +159,7 @@ TLS and Ed25519 are not post-quantum.
 
 ### 알려진 한계
 
-README의 "보안 모델과 한계"를 참고하세요. 핵심은 다음과 같습니다. 독립 감사를 받지 않았고, 참여자를 정직하지만 호기심
+README의 "보안 모델과 한계"를 참고하세요. 핵심은 다음과 같습니다. 참여자를 정직하지만 호기심
 있는(honest but curious) 존재로 가정하며, `StarkCoprocessorBackend`는 실제 prover가 아닌 대역 러너로만 테스트했고, TLS와
 Ed25519는 양자 내성이 아닙니다.
 

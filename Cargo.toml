@@ -10,11 +10,12 @@ opt-level = 3
 
 [package]
 name = "medcrypto"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Jeong Hoon Kim"]
 description = "Privacy-preserving cross-institutional healthcare data sharing: RNS-CKKS, threshold decryption, range proofs, FHIR ingestion and a consortium daemon"
-license = "MIT"
+license-file = "LICENSE"
+publish = false
 readme = "README.md"
 
 [dependencies]

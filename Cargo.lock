@@ -2497,7 +2497,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "medcrypto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "chrono",
@@ -2533,7 +2533,7 @@ dependencies = [
 
 [[package]]
 name = "medcrypto-component"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "ed25519-compact",
@@ -2549,7 +2549,7 @@ dependencies = [
 
 [[package]]
 name = "medcrypto-fhe"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "postcard",
  "rand_chacha",
@@ -2563,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "medcrypto-fhir"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "hex",

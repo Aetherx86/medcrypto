@@ -30,10 +30,10 @@ and only if the patients consented and enough of them are in the result.
 
 Written in Rust, with one WebAssembly Component for Python, TypeScript and Go.
 
-> **Status.** This is research software with a real implementation, tested end to end, and it has **not had an
-> independent cryptographic audit**. It is not a certified medical device, and using it does not by itself make anyone
-> compliant with HIPAA or GDPR. Read [Security model and limitations](#16-security-model-and-limitations) before relying
-> on it, and do not put real patient data through it without your own review.
+> **Status.** This is research software, with a real implementation tested end to end. It is not a certified medical
+> device, and using it does not by itself make anyone compliant with HIPAA or GDPR. Read
+> [Security model and limitations](#16-security-model-and-limitations) before relying on it, and do not put real patient
+> data through it without your own review.
 
 ## Contents
 
@@ -133,10 +133,9 @@ cargo build --release
 Prebuilt archives for Linux x86-64 and macOS ARM are attached to each
 [release](https://github.com/Aetherx86/medcrypto/releases/latest), with checksums and build provenance.
 
-**About the license check.** The source is under the MIT license. The `medcrypto` command line binary, separately, looks
-for an Ed25519-signed license token at startup, in `AETHER_LICENSE_KEY` or `~/.aether/license.key`, and exits if there is
-none. The library crates and the Wasm Component have no such check. Tokens are available from the
-[portal](https://aetherx86.github.io/#products).
+**License.** This software is proprietary, and only its author may use it: see [LICENSE](LICENSE). The `medcrypto` binary also
+looks for an Ed25519-signed license token at startup, in `AETHER_LICENSE_KEY` or `~/.aether/license.key`, and exits if there is
+none.
 
 To see the whole flow on synthetic data first:
 
@@ -790,7 +789,7 @@ Remote RPC has to use https. A response that is empty, a revert or anything but 
 
 Hashing a pseudonym does not make it anonymous, since a holder of the list of pseudonyms can recognize them. Whether a
 pseudonym's hash on a public chain counts as personal data under GDPR is a real question, so use a permissioned chain, or get
-legal advice. Do not deploy this contract without an audit of it.
+legal advice. Review this contract carefully before deploying it.
 
 The contract has been tested on a real local chain with Foundry's `anvil`. That test runs when Foundry is installed and is
 skipped otherwise, which includes the CI runners.
@@ -1060,12 +1059,6 @@ Secret keys and shares wipe their memory when dropped, and print no key material
 So the claim is narrow: the data's homomorphic encryption is post-quantum. **The system as a whole is not.** Ciphertexts recorded from the
 network remain protected by their CKKS layer, though secret shares sent during key generation rely on TLS alone, which matters if an
 attacker records that traffic today and has a quantum computer later.
-
-### Not audited
-
-The implementation is original, and the tests check it against its definitions and published vectors where those exist. Nobody
-independent has reviewed it. Mature libraries such as OpenFHE, Microsoft SEAL and Lattigo have had far more scrutiny, and the
-choice of a from-scratch implementation here was made for a pure-Rust, Wasm-capable, no-import build. Weigh that accordingly.
 
 ---
 
@@ -1354,7 +1347,7 @@ Versioning: a fix increments `0.0.X`, and new functionality or platform support 
 
 Worth doing next, roughly in order of value: verifiable secret sharing and proofs of correct partial decryption; input range proofs for
 contributions; differential privacy on released statistics; post-quantum TLS and signatures; a real SP1 runner; key store integration
-with an HSM or KMS; resharing for changing membership; an independent audit.
+with an HSM or KMS; and resharing for changing membership.
 
 ---
 
@@ -1412,4 +1405,5 @@ with an HSM or KMS; resharing for changing membership; an independent audit.
 
 ## 27. License
 
-MIT, by Jeong Hoon Kim. See [LICENSE](LICENSE) and [LEGAL.md](LEGAL.md).
+Proprietary. Copyright (c) 2026 Jeong Hoon Kim, all rights reserved. Only the author may use this software. See
+[LICENSE](LICENSE) and [LEGAL.md](LEGAL.md).

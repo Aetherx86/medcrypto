@@ -1,9 +1,9 @@
 [package]
 name = "medcrypto-fhir"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Jeong Hoon Kim"]
-license = "MIT"
+license-file = "../../LICENSE"
 description = "HL7 FHIR R4 ingestion: bundle parsing, LOINC and UCUM normalization, winsorization and imputation"
 publish = false
 

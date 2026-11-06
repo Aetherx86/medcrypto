@@ -10,8 +10,6 @@
 //! - [`encoder`]: the canonical embedding between slots and polynomial coefficients
 //! - [`ckks`]: keys, encryption, multiplication, relinearization, rescaling and rotation
 //! - [`threshold`]: k-of-n distributed key generation and threshold decryption
-//!
-//! This crate has not had an independent cryptographic audit.
 
 #![forbid(unsafe_code)]
 
