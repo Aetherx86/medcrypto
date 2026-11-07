@@ -1,0 +1,1577 @@
+# MedCrypto
+
+Hospitals want to answer questions together, such as "what is the average HbA1c of diabetic patients across
+our three institutions?", and privacy law stops them from pooling patient records to do it. MedCrypto lets them compute
+the answer without any of them, or anyone else, seeing another hospital's records.
+
+Each hospital reads its own EMR through HL7 FHIR, encrypts the results, and sends only ciphertexts to the others. They
+add the ciphertexts up without decrypting anything. The total can be decrypted only when several hospitals cooperate,
+and only if the patients consented and enough of them are in the result.
+
+```text
+ Hospital A                     Hospital B                      Hospital C
+ FHIR server                    FHIR server                     FHIR server
+     |                              |                               |
+     v                              v                               v
+ clean, pseudonymize            clean, pseudonymize             clean, pseudonymize
+ filter by consent              filter by consent               filter by consent
+ encrypt (RNS-CKKS)             encrypt (RNS-CKKS)              encrypt (RNS-CKKS)
+     |                              |                               |
+     +-------- ciphertexts over gRPC + mutual TLS, no central server -+
+                                    |
+                 every node adds them up, without any key
+                                    |
+                 any 2 of 3 nodes decrypt the totals only
+                                    |
+                 count 1500, mean HbA1c 7.106 %, std. dev. 1.370
+```
+
+Written in Rust, with one WebAssembly Component for Python, TypeScript and Go. It has two homomorphic schemes, CKKS for
+approximate real numbers and BFV for exact integers, available in the library, the command line, the daemon and Wasm alike. Against
+quantum computers, it signs with ML-DSA-65 alongside Ed25519, exchanges TLS keys with ML-KEM-768 alongside X25519, and has a
+range proof that rests only on SHA-256.
+
+## Contents
+
+1. [The ideas in five minutes](#1-the-ideas-in-five-minutes)
+2. [What it can do](#2-what-it-can-do)
+3. [Install and build](#3-install-and-build)
+4. [Tutorial: one hospital](#4-tutorial-one-hospital)
+5. [Tutorial: three hospitals with the daemon](#5-tutorial-three-hospitals-with-the-daemon)
+6. [Tutorial: erasing a patient](#6-tutorial-erasing-a-patient)
+7. [Tutorial: proving a lab value is in range](#7-tutorial-proving-a-lab-value-is-in-range)
+8. [Homomorphic encryption in depth](#8-homomorphic-encryption-in-depth)
+9. [Packing: horizontal and vertical](#9-packing-horizontal-and-vertical)
+10. [FHIR ingestion](#10-fhir-ingestion)
+11. [Zero-knowledge proofs and post-quantum backends](#11-zero-knowledge-proofs-and-post-quantum-backends)
+12. [The consortium daemon](#12-the-consortium-daemon)
+13. [Threshold decryption](#13-threshold-decryption)
+14. [WebAssembly Component](#14-webassembly-component)
+15. [Rust library](#15-rust-library)
+16. [Cryptographic security architecture](#16-cryptographic-security-architecture)
+17. [Regulatory mapping](#17-regulatory-mapping)
+18. [Performance](#18-performance)
+19. [Command reference](#19-command-reference)
+20. [File formats](#20-file-formats)
+21. [Clinical AI module and the GUI](#21-clinical-ai-module-and-the-gui)
+22. [Repository layout](#22-repository-layout)
+23. [Testing and CI/CD](#23-testing-and-cicd)
+24. [Roadmap status](#24-roadmap-status)
+25. [Troubleshooting](#25-troubleshooting)
+26. [Glossary](#26-glossary)
+27. [License](#27-license)
+
+---
+
+## 1. The ideas in five minutes
+
+No cryptography background is needed for this section.
+
+**Homomorphic encryption** means computing on data while it stays encrypted. If `Enc(5)` and `Enc(7)` are ciphertexts,
+anybody can produce `Enc(12)` from them with no key and no idea of the numbers inside. MedCrypto uses a scheme called
+CKKS, which works on vectors of real numbers and gives approximate answers, accurate to several decimal places. That
+suits lab values well.
+
+**Slots** are the positions inside one ciphertext. A single ciphertext here holds 4096 numbers, and adding two
+ciphertexts adds them position by position, which is why one operation can process thousands of patients.
+
+**Levels** are a budget. Each multiplication adds noise and uses up one level to remove it. The smaller parameter set
+has two levels, so at most two multiplications in a row. Additions and rotations cost no levels at all. Statistics need
+only additions, which is why they are so cheap.
+
+**Threshold decryption** means there is no single secret key anywhere. The hospitals generate a key together, and
+each ends up holding a share of it. Any `k` of them can decrypt together, and `k - 1` learn nothing. So no hospital
+can read the others' data alone, and one being offline does not stop the work.
+
+**A zero-knowledge proof** convinces someone that a statement is true while revealing nothing else. "This patient's
+HbA1c is at most 6.5%" can be verified without learning that it is 5.8%.
+
+**Cryptographic shredding** handles the right to erasure. Each patient's record gets its own key. Destroying that key
+makes every copy of the record unreadable, including backups of the ciphertext and copies on an immutable ledger.
+
+**Post-quantum** means safe against a future large quantum computer. CKKS and BFV rest on a lattice problem with no known
+efficient quantum attack, and so do ML-DSA signatures and ML-KEM key exchange. Hash functions survive too, which is what the
+post-quantum range proof rests on. See [Section 16](#16-cryptographic-security-architecture) for the full cryptographic matrix.
+
+---
+
+## 2. What it can do
+
+| Capability | How | Where |
+| :--- | :--- | :--- |
+| Encrypted arithmetic on real vectors | RNS-CKKS at `N = 8192` or `16384`, 128 post-quantum bits by the HE Standard's table | [`crates/medcrypto-fhe`](crates/medcrypto-fhe) |
+| Encrypted arithmetic on exact integers | RNS-BFV on the same primes, with batching into `N` slots, threshold decryption, the daemon, the command line and Wasm | [`bfv.rs`](crates/medcrypto-fhe/src/bfv.rs) |
+| Multiplication, relinearization, rescaling | Hybrid key switching with one digit per prime | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) |
+| Slot rotation | Galois keys, applied by permutation in the NTT domain | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) |
+| Clinical scoring on ciphertexts | Linear models, cubic polynomials, a logistic curve | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) |
+| No single key holder | k-of-n key generation and threshold decryption | [`threshold.rs`](crates/medcrypto-fhe/src/threshold.rs) |
+| EMR input | FHIR R4 parsing, LOINC, UCUM conversion, winsorization, imputation | [`crates/medcrypto-fhir`](crates/medcrypto-fhir) |
+| Per-patient and cohort packing | `RecordEnvelope` and `CohortBatch` | [`src/packing`](src/packing) |
+| Range proofs | Hash-based and post-quantum, or Pedersen over ristretto255 for speed, or an external prover | [`src/zkp`](src/zkp), [`range_proof.rs`](crates/medcrypto-pq/src/range_proof.rs) |
+| Multi-hospital daemon | gRPC over mutual TLS with hybrid X25519 and ML-KEM-768 key exchange, signed messages, no central server | [`src/consortium`](src/consortium) |
+| Post-quantum signatures | ML-DSA-65 (FIPS 204) and Ed25519 together, with both required | [`signatures.rs`](crates/medcrypto-pq/src/signatures.rs) |
+| Consent | File ledger, or a smart contract through JSON-RPC | [`consent.rs`](src/consortium/consent.rs), [`ConsentRegistry.sol`](contracts/ConsentRegistry.sol) |
+| Erasure and audit | Per-record keys, destroyed on request, with a hash-chained audit log | [`src/compliance`](src/compliance/mod.rs) |
+| Other languages | One Wasm Component with no imports | [`component`](component) |
+
+---
+
+## 3. Install and build
+
+You need a stable Rust toolchain (tested with 1.99) and a C compiler, which the TLS library builds with. No `protoc` is needed,
+because the gRPC definitions compile in pure Rust. The homomorphic encryption and proof crates are pure Rust, with no unsafe code.
+
+```bash
+git clone https://github.com/Aetherx86/medcrypto.git
+cd medcrypto
+cargo build --release
+./target/release/medcrypto --help
+```
+
+Prebuilt archives for Linux x86-64 and macOS ARM are attached to each
+[release](https://github.com/Aetherx86/medcrypto/releases/latest), with checksums and build provenance. There is also a
+container image, which is the easy way to run a daemon:
+
+```bash
+docker pull ghcr.io/aetherx86/medcrypto:latest
+docker run --rm -e AETHER_LICENSE_KEY ghcr.io/aetherx86/medcrypto:latest --help
+```
+
+**License.** This work is under [CC BY-NC-ND 4.0](LICENSE): it may be shared with attribution, for non-commercial purposes
+only, and modified versions may not be distributed. The `medcrypto` binary also looks for an Ed25519-signed license token at startup, in `AETHER_LICENSE_KEY` or `~/.aether/license.key`, and exits if there is
+none.
+
+To see the whole flow on synthetic data first:
+
+```bash
+./target/release/medcrypto demo
+```
+
+---
+
+## 4. Tutorial: one hospital
+
+This goes from a FHIR bundle to encrypted statistics on one machine. Everything below was run as written, and the data
+comes from a generator that makes random patients.
+
+**Make some data.** About half of the glucose results are in mg/dL and half in mmol/L, as in real multi-site data.
+
+```bash
+cargo build --release --examples
+./target/release/examples/make_sample_bundle 400 1 > site-a.json
+./target/release/examples/make_sample_bundle 600 2 > site-b.json
+```
+
+**Make keys.** This writes `secret-key.json`, readable only by you, and three public files: `public-key.json`,
+`galois-keys.json` and `relin-key.json`.
+
+```bash
+./target/release/medcrypto keygen --output-dir keys
+```
+
+**Ingest and encrypt.** `2339-0` and `15074-8` are both glucose, in different units, so they become one column in mg/dL.
+
+```bash
+./target/release/medcrypto ingest-fhir \
+  --bundle site-a.json \
+  --loinc-filter 8480-6,4548-4,2339-0,15074-8 \
+  --mode vertical \
+  --public-key keys/public-key.json \
+  --output a.ct.json
+```
+
+```text
+Parsed 400 patients and 1200 observations. Left out: 0 by status, 0 incomplete, 0 other resources.
+[NOTE] created the pseudonym key a.ct.json.pseudonym-key. Keep it, or pseudonyms will change.
+Encrypting 400 patients and 3 analytes...
+[SUCCESS] 1 batch(es) per analyte written to a.ct.json
+          a.ct.json.slots maps slots to patients, and stays inside the hospital.
+| Analyte     | Unit   | Results | Unknown unit | Implausible | Winsorized | Missing | Imputed |
+| systolic_bp | mm[Hg] | 400     | 0            | 0           | 0          | 0       | 0       |
+| hba1c       | %      | 400     | 0            | 0           | 0          | 0       | 0       |
+| glucose     | mg/dL  | 400     | 0            | 0           | 0          | 0       | 0       |
+```
+
+Three files came out, and they go to different places:
+
+| File | What it is | Where it goes |
+| :--- | :--- | :--- |
+| `a.ct.json` | The ciphertexts. No identifiers in it | Can leave the hospital |
+| `a.ct.json.slots` | Which pseudonym is in which slot | Stays inside |
+| `a.ct.json.pseudonym-key` | The secret behind the pseudonyms | Stays inside, and keep it |
+
+**Do the same for site B, merge, and compute.** Merging collects batches. Nothing is decrypted at any point until the
+last command, and that decrypts only totals.
+
+```bash
+./target/release/medcrypto ingest-fhir --bundle site-b.json \
+  --loinc-filter 8480-6,4548-4,2339-0,15074-8 --mode vertical \
+  --public-key keys/public-key.json --output b.ct.json
+
+./target/release/medcrypto cohort-merge a.ct.json b.ct.json --output ab.ct.json
+./target/release/medcrypto cohort-stats --input ab.ct.json --keys keys
+```
+
+```text
+| Analyte     | Unit   | Count | Mean    | Std. deviation |
+| systolic_bp | mm[Hg] | 1000  | 135.490 | 20.629         |
+| hba1c       | %      | 1000  | 7.089   | 1.355          |
+| glucose     | mg/dL  | 1000  | 133.561 | 37.341         |
+```
+
+Results from fewer than 11 patients are withheld by default. Change that with `--min-cell-size`.
+
+This tutorial has one key holder, so that person could decrypt everything. For the real setting, where nobody can, see
+the next section.
+
+**From a live FHIR server** instead of a file, use `--endpoint`. A bearer token goes in the `MEDCRYPTO_FHIR_TOKEN`
+environment variable, so that it stays out of your shell history.
+
+```bash
+export MEDCRYPTO_FHIR_TOKEN=...
+./target/release/medcrypto ingest-fhir \
+  --endpoint "https://emr.hospital.org/fhir/R4" \
+  --loinc-filter "8480-6,4548-4,2339-0" \
+  --mode vertical \
+  --output ./encrypted_cohort.json
+```
+
+**From `PatientRecord` JSON files** in a directory, use `batch-pack`:
+
+```bash
+./target/release/medcrypto batch-pack \
+  --input-dir ./patient_records/ \
+  --batch-size 4096 \
+  --output ./cohort_vertical_ct.json
+```
+
+Without `--public-key`, these commands create a key set next to the output, in `<output>.keys/`, so a first try just works.
+
+---
+
+## 5. Tutorial: three hospitals with the daemon
+
+Three real daemons on one machine, talking gRPC over mutual TLS, with a 2-of-3 threshold. In a real deployment each
+would run at its own hospital, and only the endpoints would change.
+
+**Step 1. Create the consortium.** This makes a certificate authority, a certificate and signing key for each node, a
+shared `roster.json`, and a `node.json` for each.
+
+```bash
+M=./target/release/medcrypto
+$M consortium-init --out consortium --threshold 2 --nodes \
+  hospital-a=https://127.0.0.1:7443,hospital-b=https://127.0.0.1:7444,hospital-c=https://127.0.0.1:7445
+```
+
+**Step 2. Each hospital prepares its table.** `--mode table` runs the cleaning pipeline and stops before encryption. The
+daemon encrypts later, once the collective key exists and it knows who consented. This file holds patient data, so it
+stays at that hospital.
+
+```bash
+./target/release/examples/make_sample_bundle 500 3 > site-c.json
+for s in a b c; do
+  $M ingest-fhir --bundle site-$s.json \
+    --loinc-filter 8480-6,4548-4,2339-0,15074-8 --mode table \
+    --output consortium/hospital-$s/data/cohorts/diabetes-2026.json \
+    --pseudonym-key consortium/hospital-$s/pseudonym.key
+done
+```
+
+**Step 3. Define the study** in `consortium/studies.json`, which all hospitals share:
+
+```json
+[{
+  "id": "diabetes-2026",
+  "epoch": 1,
+  "scope": "DIABETES_STATISTICS",
+  "analytes": ["systolic_bp", "hba1c", "glucose"],
+  "participants": ["hospital-a", "hospital-b", "hospital-c"],
+  "min_cell_size": 11
+}]
+```
+
+**Step 4. Record consent.** For this tutorial, every patient consents and the study is not approved yet. In production,
+this would be the smart contract in [Section 12](#consent-sources) rather than a file.
+
+```bash
+UNTIL=$(($(date +%s)+31536000))
+jq -s --argjson until $UNTIL '{
+    studies: [{id: "diabetes-2026", epoch: 1, active: false}],
+    consents: [.[].rows[].pseudo_id | {patient: ., scope: "DIABETES_STATISTICS", valid_until: $until, active: true}]
+  }' consortium/hospital-*/data/cohorts/diabetes-2026.json > consortium/consent.json
+```
+
+**Step 5. Start the daemons**, in three terminals. They run distributed key generation among themselves, which takes
+a few seconds, and then wait.
+
+```bash
+$M daemon run --config consortium/hospital-a/node.json
+$M daemon run --config consortium/hospital-b/node.json
+$M daemon run --config consortium/hospital-c/node.json
+```
+
+```bash
+$M daemon status --config consortium/hospital-a/node.json --node hospital-c
+```
+
+```text
+Node:      hospital-c
+Keys:      ready
+Running:   []
+Finished:  []
+Failed:    []
+```
+
+**Step 6. Approve the study.** This is the only trigger: nobody sends a command to a server, because there is no server.
+
+```bash
+jq '.studies[0].active = true' consortium/consent.json > c.tmp && mv c.tmp consortium/consent.json
+```
+
+Within seconds, each daemon filters its table by consent, encrypts, exchanges ciphertexts, adds them up, compares hashes,
+and releases the result with two partial decryptions:
+
+```bash
+cat consortium/hospital-b/data/results/*.json | jq -c '.analytes[]'
+```
+
+```json
+{"status":"released","analyte":"systolic_bp","unit":"mm[Hg]","count":1500,"mean":135.2394,"variance":424.722,"standard_deviation":20.6088}
+{"status":"released","analyte":"hba1c","unit":"%","count":1500,"mean":7.1062,"variance":1.8775,"standard_deviation":1.3702}
+{"status":"released","analyte":"glucose","unit":"mg/dL","count":1500,"mean":134.2220,"variance":1418.5607,"standard_deviation":37.6638}
+```
+
+Each node also has `data/audit.json`, a hash chain recording what it contributed and released.
+
+**The same study with exact results.** Add a `scheme` to the study, and everything else stays the same: the same collective keys,
+the same 2-of-3 decryption and the same commands. Values become integers by the `fixed_point` factor, so 100 keeps two decimals.
+
+```json
+"scheme": {"type": "bfv", "plain_bits": 50, "fixed_point": 100}
+```
+
+```json
+{"status":"released","analyte":"systolic_bp","unit":"mm[Hg]","count":1000,"mean":135.49024,"variance":425.5489,"standard_deviation":20.6288}
+```
+
+Things to try next: revoke one patient's consent before approving a new epoch and watch the count drop; set
+`min_cell_size` above the cohort and watch the result come back as `suppressed`; stop one daemon after key generation and
+see that the other two still finish a study that has only them as participants.
+
+---
+
+## 6. Tutorial: erasing a patient
+
+```bash
+M=./target/release/medcrypto
+$M pack-record --record-id P-8001 --values 52,5.8,105 --features age,hba1c,glucose \
+  --public-key keys/public-key.json --output record.json
+
+$M open-record --input record.json --secret-key keys/secret-key.json
+```
+
+```text
+age: 52.0000
+hba1c: 5.8000
+glucose: 105.0000
+```
+
+```bash
+$M shred --record-id P-8001
+```
+
+```text
+Record ID:        P-8001
+Destroyed Key ID: key:envelope:P-8001
+Legal Basis:      GDPR Article 17 - Right to Erasure / Cryptographic Shredding
+[CONFIRMED] The key is gone from medcrypto-keystore.json.
+```
+
+Now `open-record` fails, even with the FHE secret key and the envelope in hand, and this holds in any later process.
+Shredding a record with no key is an error, and no certificate is issued for it.
+
+---
+
+## 7. Tutorial: proving a lab value is in range
+
+```bash
+M=./target/release/medcrypto
+$M prove --metric hba1c --value 58 --threshold 65 --output proof.json
+$M verify --proof-file proof.json
+```
+
+```text
+[VERIFIED] The proof is valid.
+The committed value is at most 65, with nothing else revealed about it.
+```
+
+The value is scaled to an integer, so 58 here means 5.8%. Use `--lower-bound` for "at least", such as age 18 or over.
+
+A false claim gets no proof, and editing the threshold in a proof file makes verification fail. The proof is 2,242 bytes
+for this range.
+
+For production, use the post-quantum backend, which rests only on SHA-256. The Pedersen backend is refused there:
+
+```bash
+$M prove --value 58 --threshold 65 --profile production
+# [ERROR] proof backend: the production profile refuses the Pedersen backend, which is not post-quantum: use the hash backend
+
+$M prove --value 58 --threshold 65 --profile production --backend hash --output pq.json
+$M verify --proof-file pq.json --profile production --backend hash
+```
+
+That proof takes about 40 ms to make or check, and is 1.3 MB. An external prover can also stand in with `--backend stark`.
+
+---
+
+## 8. Homomorphic encryption in depth
+
+### Parameters
+
+| Preset | `N` | Slots | Chain, in bits | Special prime | Total `log QP` | Limit, quantum 128 | Multiplications |
+| :--- | ---: | ---: | :--- | ---: | ---: | ---: | ---: |
+| `N8192` | 8192 | 4096 | 60, 40, 40 | 60 | 200 | 202 | 2 |
+| `N16384` | 16384 | 8192 | 60, 40 x 7 | 60 | 400 | 411 | 7 |
+
+The limits are from the Homomorphic Encryption Standard's table for ternary secrets, as published in Microsoft SEAL's
+`hestdparms.h`. `CkksParams::validate` enforces them, so a chain that is too long is an error rather than a quiet loss of
+security. The default scale is `2^40`. The secret is uniform ternary, and the error is a centered binomial of standard
+deviation 3.24, which is close to the 3.2 the table assumes.
+
+`medcrypto quantum-audit` shows the same check. It reads a published table. It does not run a lattice estimator.
+
+### How the code is organized
+
+| Layer | File | What is in it |
+| :--- | :--- | :--- |
+| Word arithmetic | [`arith.rs`](crates/medcrypto-fhe/src/arith.rs) | Barrett and Shoup reduction with mask-based conditional subtraction, deterministic Miller-Rabin, NTT prime search |
+| Transform | [`ntt.rs`](crates/medcrypto-fhe/src/ntt.rs) | Negacyclic NTT and the Galois permutation |
+| Parameters | [`params.rs`](crates/medcrypto-fhe/src/params.rs) | The presets, the standard's table, validation |
+| Encoding | [`encoder.rs`](crates/medcrypto-fhe/src/encoder.rs) | The canonical embedding, with the `5^j` slot order |
+| Polynomials | [`rns.rs`](crates/medcrypto-fhe/src/rns.rs) | RNS representation, hexadecimal in JSON and raw bytes in binary |
+| Scheme | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) | Everything else |
+| Threshold | [`threshold.rs`](crates/medcrypto-fhe/src/threshold.rs) | Key generation and decryption among parties |
+
+The crate has `#![forbid(unsafe_code)]`, and no C dependencies.
+
+### Why RNS
+
+The ciphertext modulus `Q` is a product of primes that each fit a machine word. By the Chinese Remainder Theorem, a number
+modulo `Q` can be stored as one residue per prime, and addition and multiplication then work on each residue on its own,
+with no big-integer arithmetic at all. Combined with the NTT, multiplying two polynomials costs `O(N log N)` word
+multiplications per prime. The last prime in the chain also gives rescaling its divisor directly.
+
+### Operations
+
+| Operation | Function | Level cost | Key needed | Notes |
+| :--- | :--- | ---: | :--- | :--- |
+| Add, subtract | `add`, `sub` | 0 | None | Levels and scales have to match, or it is an error |
+| Add a constant | `add_constant` | 0 | None | To every slot |
+| Multiply by a whole number | `scalar_mul` | 0 | None | - |
+| Multiply by a fraction | `scalar_mul` | 1 | None | The scale comes back exactly |
+| Multiply by plaintext weights | `multiply_plain_rescale` | 1 | None | Slot by slot |
+| Multiply two ciphertexts | `multiply` | 0, then rescale for 1 | None | Gives degree 2 |
+| Relinearize | `relinearize` | 0 | `RelinKey` | Degree 2 back to 1 |
+| Rescale | `rescale_to_next` | 1 | None | Divides by the last prime |
+| Rotate | `rotate` | 0 | `GaloisKey` for that step | Negative steps go right |
+| Sum all slots | `sum_slots` | 0 | `GaloisKey` for powers of two | `log2(slots)` rotations |
+| Federated average | `federated_average` | 0 | None | Adds, and multiplies the recorded scale by the count |
+| Linear score | `evaluate_linear_risk_model` | 1 | `GaloisKey` | `sum(w * x) + bias` in every slot |
+| Cubic | `evaluate_cubic` | 2 | `RelinKey` | - |
+| Logistic | `evaluate_logistic` | 2 | `RelinKey` | `0.5 + 0.15012 x - 0.001593 x^3`, meaningful only on `[-8, 8]` |
+| Drop levels | `mod_switch_to_level` | any | None | To line up two ciphertexts |
+
+### Key switching
+
+Relinearization and rotation both have to change which secret a piece of a ciphertext is under. The method here
+is hybrid key switching with one digit per ciphertext prime and a single special prime `P`. For each digit `i`, the key
+holds `(b_i, a_i)` with `b_i = -a_i s + e_i + P * s'`, the last term on prime `q_i` only. Switching breaks the polynomial
+into its residues, multiplies each by its key, adds them up over `Q * P`, and divides by `P`, which removes most of the
+noise. `P` is the largest prime, so that the noise left over is small compared to the scale.
+
+### Rotation without a transform
+
+An automorphism `X -> X^g` only permutes a polynomial's evaluation points. So in the NTT domain, a rotation is a table
+lookup and needs no transform at all, which [`galois_permutation`](crates/medcrypto-fhe/src/ntt.rs) computes. A test
+checks it against the coefficient-domain definition.
+
+Summing all slots uses doubling: add the ciphertext to itself rotated by 1, then that to itself rotated by 2, then by 4, and
+so on. After `log2(slots)` steps, **every slot holds the total**. This is what makes threshold decryption of statistics
+safe: what gets decrypted has no individual values left in it.
+
+### Keeping scales straight
+
+Rescaling divides by a prime close to `2^40` but not equal to it, so the scale drifts slightly. Adding two ciphertexts at
+different scales would give a wrong answer, so `add` refuses when they differ by more than one part in `10^9`. The engine
+avoids the problem where it can. `multiply_plain_rescale` and fractional `scalar_mul` encode their constant at exactly
+the scale of the prime being dropped, so the scale comes back unchanged. `evaluate_cubic` picks a separate constant for
+each term, so that all terms arrive at one exact final scale.
+
+A worked example of the budget, for `0.25 x^3 - 0.5 x^2 + 2 x + 1` at `N = 8192`:
+
+```text
+Level 2:  x at scale 2^40
+          x * x, relinearized and rescaled      -> x^2 at level 1
+          x * 0.25, rescaled                    -> 0.25 x at level 1
+Level 1:  x^2 * 0.25 x, relinearized and rescaled -> 0.25 x^3 at level 0, scale t
+          x^2 * -0.5, rescaled, constant chosen -> -0.5 x^2 at level 0, scale t
+          x * 2 (x dropped a level first), the same way -> 2 x at level 0, scale t
+Level 0:  add all three, and add the constant 1 at scale t
+```
+
+### Precision and capacity
+
+- A fresh ciphertext decrypts with an error under `10^-5` for values in the low hundreds, which the tests assert.
+- A value's size is limited by the modulus at its level. Encoding refuses a coefficient that would not fit, rather than
+  wrapping around silently. So at level 0 of `N8192`, with only the 60-bit prime left and scale `2^40`, the limit is
+  around `2^19`, which is why cohort totals are kept at the top level.
+- Multiplication refuses a product whose scale would not fit the remaining modulus.
+- Noise grows along with the value in repeated squaring, so relative error is the measure to use there. Seven squarings
+  of 1.1 at `N16384` come out with a relative error of about `10^-6`.
+
+### BFV: exact integers
+
+CKKS answers approximately, which suits lab values. BFV answers exactly, which suits counts, codes and anything where 1234 must
+not come back as 1234.00002. [`BfvEngine`](crates/medcrypto-fhe/src/bfv.rs) runs on the same ring, primes, NTT and key switching,
+so the same line of the standard's table applies.
+
+| Aspect | CKKS | BFV |
+| :--- | :--- | :--- |
+| Values | Real numbers | Integers in `(-t/2, t/2]` |
+| Answers | Approximate, about five decimal places | Exact, modulo `t` |
+| Slots | `N/2` | `N`, as two rows of `N/2` |
+| Multiplication limit | Levels, spent by rescaling | A noise budget, with no rescaling |
+| What goes wrong at the limit | Refused, as out of levels | Silently wrong answers, so watch `noise_budget_bits` |
+| What goes wrong on overflow | Refused at encoding | Wraps around modulo `t`, so choose `t` above any result |
+| Used by the daemon, command line and Wasm | Yes | Yes |
+
+```rust
+let bfv = BfvEngine::new(CkksPreset::N8192, 20)?;      // A 20-bit plaintext modulus. Up to 50 bits.
+let (secret, public) = bfv.keygen();
+let relin = bfv.relin_keygen(&secret);
+let x = bfv.encrypt(&public, &[1000, -2000, 3])?;
+let y = bfv.encrypt(&public, &[5, 60, -7])?;
+let product = bfv.multiply_relin(&x, &y, &relin)?;
+assert_eq!(bfv.decrypt(&secret, &product)?, [5000, -120000, -21]);
+```
+
+**Noise budget.** Each multiplication uses up budget, and the choice of `t` trades against it: a larger `t` wraps around later and
+leaves less room. These are measured, by the `measure_budgets` test, as the bits left after each multiplication of a chain. Below
+1 bit, decryption is wrong.
+
+| Preset | `t` | Fresh | After multiplications 1, 2, 3, ... | Multiplications that work |
+| :--- | ---: | ---: | :--- | ---: |
+| `N8192` | 20 bits | 101 | 68, 36, 3 | 3 |
+| `N8192` | 30 bits | 80 | 37 | 1 |
+| `N8192` | 40 bits | 60 | 6 | 1 |
+| `N16384` | 20 bits | 301 | 268, 235, 202, 169, 135, 102, 68, 34 | 8 |
+| `N16384` | 30 bits | 283 | 239, 196, 153, 109, 65, 21 | 6 |
+| `N16384` | 40 bits | 261 | 207, 154, 100, 47 | 4 |
+
+`t` has to be a prime that is 1 mod `2N`, and few of those are small: at `N16384`, the largest 20-bit one is 786433. Cohort statistics
+take only additions, so they use a 50-bit `t`, which leaves plenty of room for sums.
+
+**From the command line.** Packing a cohort takes `--scheme bfv`, and `cohort-merge` and `cohort-stats` recognize what they are given:
+
+```bash
+M=./target/release/medcrypto
+$M bfv-encrypt --values 1000,-2000,3 --public-key keys/public-key.json --output ints.json
+$M bfv-decrypt --input ints.json --secret-key keys/secret-key.json     # 1000, -2000, 3
+
+$M ingest-fhir --bundle site-a.json --loinc-filter 8480-6,4548-4 --mode vertical \
+  --scheme bfv --fixed-point 100 --public-key keys/public-key.json --output a.bfv.json
+$M cohort-stats --input a.bfv.json --keys keys
+```
+
+Packing refuses a cohort whose sum of squares could reach `t`, with room left for other sites, since an overflow under encryption
+could not be noticed afterwards.
+
+**Exact scaling.** A BFV multiplication needs `round(t * x / Q)` for an `x` larger than `Q` can hold. The usual RNS methods
+approximate this in floating point. Here it is exact, in word arithmetic only. Each polynomial is lifted from `Q` to an auxiliary
+basis `B` through balanced mixed-radix digits, and multiplied in `Q * B`. Then `y = t * x + floor(Q / 2)` is split as `Q * z + r`. The
+residues of `y` modulo `Q` are exactly those of `r`, so `r` can be lifted to `B`, and `z = (y - r) / Q` is a plain division in each
+prime of `B`. It costs more than the approximate methods: a multiplication takes 12 ms at `N = 8192`, against 0.14 ms for CKKS.
+
+**Operations.** `add`, `sub`, `negate`, `add_plain`, `multiply_plain`, `multiply`, `relinearize`, `multiply_relin`, `rotate_rows`,
+`swap_rows`, `sum_all` and `noise_budget_bits`. `sum_all` gives every slot the total of all `N`, using keys from `sum_galois_keygen`.
+
+Both schemes use the same kind of key, so a consortium's collective keys serve both, and keys from any earlier version work for BFV.
+`sum_rows` needs only the rotation keys those already hold, for values in the first row of slots, which is what cohorts use.
+
+---
+
+## 9. Packing: horizontal and vertical
+
+The two modes solve opposite problems, and that is why both exist.
+
+| Aspect | Horizontal: `RecordEnvelope` | Vertical: `CohortBatch` |
+| :--- | :--- | :--- |
+| One ciphertext holds | Many analytes of one patient | One analyte of up to 4096 or 8192 patients |
+| Good for | Scoring one patient, and erasure | Statistics over a cohort |
+| Outer key | One per patient, AES-256-GCM | None |
+| Erasure | Destroy the key | Rebuild the batch |
+| Size per 1000 patients, 3 analytes | 1000 ciphertexts | 9 ciphertexts |
+
+```text
+                 age   sbp   hba1c  glucose
+ patient 1  [    54    128   5.8    110    ]  <- horizontal: one ciphertext per row
+ patient 2  [    61    140   7.1    160    ]
+ patient 3  [    47    119   5.4     95    ]
+                  ^     ^     ^      ^
+                  vertical: one ciphertext per column
+```
+
+### Vertical packing
+
+For each analyte, and each batch of patients, there are three ciphertexts:
+
+| Ciphertext | Slot `i` holds | Sum over slots gives |
+| :--- | :--- | :--- |
+| `values` | Patient `i`'s value, or 0 if missing | `sum` |
+| `squares` | That value squared | `sum_of_squares` |
+| `presence` | 1 if patient `i` has a value, otherwise 0 | `count` |
+
+Then `mean = sum / count`, and `variance = (sum_of_squares - sum^2 / count) / (count - 1)`. The presence mask is what lets
+a missing result be left out rather than counted as a zero. The squares are computed at the hospital before
+encryption, so that the aggregation needs no multiplication and no relinearization key under the collective secret.
+
+A cohort larger than `--batch-size` spans several batches. The batch size can be at most the slot count.
+
+Merging two cohorts collects their batches without any arithmetic, since slot 7 at one hospital and slot 7 at another are
+different people. Merging refuses cohorts with different analytes or different units.
+
+### Horizontal packing
+
+`RecordEnvelope::seal` encrypts the patient's vector with CKKS, then wraps those bytes in AES-256-GCM under a key used for
+that record only. The AES layer is what provides erasure, and CKKS still protects the data while it is being computed on.
+
+With `ingest-fhir --mode horizontal`, each missing value goes in as 0, and a parallel `<analyte>.present` slot records
+whether it was real.
+
+---
+
+## 10. FHIR ingestion
+
+[`crates/medcrypto-fhir`](crates/medcrypto-fhir) is a separate crate with no dependency on the cryptography. Its output is a plain
+table.
+
+### Pipeline, in order
+
+1. **Fetch or read.** `GET {endpoint}/Observation?code=http://loinc.org|...&_include=Observation:subject&_count=500`, following
+   `next` links.
+2. **Parse.** `Patient`, `Observation` (with `component` for blood pressure panels) and `Condition`. Other resources are
+   counted and skipped.
+3. **Filter by status.** Only `final`, `amended` and `corrected` results count. `entered-in-error`, `preliminary` and
+   others are left out and counted.
+4. **Drop incomplete results.** No numeric value, no LOINC code, a subject that is not a patient, or a comparator such as
+   `<40`, where the real value is not the number shown.
+5. **Convert units.** To the analyte's canonical unit. An unknown unit is dropped and counted, and never guessed: mistaking
+   mmol/L for mg/dL would be off by a factor of 18.
+6. **Check plausibility.** A value outside the analyte's plausible limits is dropped as an error, since it usually means a
+   wrong unit.
+7. **Pick the latest** result per patient and analyte. Codes for the same analyte merge into one column.
+8. **Winsorize.** `--winsorize clinical` (default) clamps to catalog limits, `p1p99` clamps to this cohort's 1st and 99th
+   percentiles, and `off` leaves values alone.
+9. **Impute.** `--impute none` (default) leaves results missing, `median` and `mean` fill them in. Keep the default for
+   federated statistics, since imputed values count as present and pull the variance down.
+10. **Pseudonymize.** `HMAC-SHA256(site secret, patient id)`. A plain hash would not do, because anybody could hash every
+    possible record number. Rows are sorted by pseudonym, so slot order reveals nothing about record number or admission order.
+
+Every step's counts appear in the quality report, per analyte, so a study can report them.
+
+### LOINC catalog
+
+| Analyte (`id`) | Canonical unit | LOINC codes | Accepted units |
+| :--- | :--- | :--- | :--- |
+| Systolic BP (`systolic_bp`) | `mm[Hg]` | 8480-6 | `mm[Hg]`, `mmHg`, `kPa` |
+| Diastolic BP (`diastolic_bp`) | `mm[Hg]` | 8462-4 | `mm[Hg]`, `mmHg`, `kPa` |
+| HbA1c, NGSP (`hba1c`) | `%` | 4548-4, 17856-6, 59261-8 | `%`, `mmol/mol` |
+| Glucose (`glucose`) | `mg/dL` | 2339-0, 2345-7, 15074-8, 14749-6 | `mg/dL`, `mmol/L`, `g/L` |
+| Fasting glucose (`fasting_glucose`) | `mg/dL` | 1558-6, 14771-0 | `mg/dL`, `mmol/L`, `g/L` |
+| Total cholesterol (`total_cholesterol`) | `mg/dL` | 2093-3, 14647-2 | `mg/dL`, `mmol/L`, `g/L` |
+| LDL (`ldl_cholesterol`) | `mg/dL` | 2089-1, 13457-7, 18262-6, 22748-8 | `mg/dL`, `mmol/L`, `g/L` |
+| HDL (`hdl_cholesterol`) | `mg/dL` | 2085-9, 14646-4 | `mg/dL`, `mmol/L`, `g/L` |
+| Triglycerides (`triglycerides`) | `mg/dL` | 2571-8, 14927-8 | `mg/dL`, `mmol/L`, `g/L` |
+| Creatinine (`creatinine`) | `mg/dL` | 2160-0, 14682-9 | `mg/dL`, `umol/L`, `mmol/L` |
+| eGFR (`egfr`) | `mL/min/{1.73_m2}` | 33914-3, 48642-3, 48643-1, 62238-1, 98979-8 | `mL/min/{1.73_m2}`, `mL/min/1.73m2`, `mL/min` |
+| BMI (`bmi`) | `kg/m2` | 39156-5 | `kg/m2` |
+| Weight (`body_weight`) | `kg` | 29463-7, 3141-9 | `kg`, `g`, `[lb_av]`, `lb` |
+| Height (`body_height`) | `cm` | 8302-2, 8306-3 | `cm`, `m`, `[in_i]`, `in` |
+| Heart rate (`heart_rate`) | `/min` | 8867-4 | `/min`, `{beats}/min`, `{beat}/min`, `bpm` |
+| Temperature (`body_temperature`) | `Cel` | 8310-5 | `Cel`, `C`, `[degF]`, `F` |
+
+Molar conversions depend on the molecule: glucose uses 180.156 g/mol, cholesterol 386.65 g/mol, triglycerides 885.7 g/mol
+(as triolein), creatinine 113.12 g/mol. HbA1c from IFCC to NGSP uses the master equation `% = 0.09148 * mmol/mol + 2.152`.
+
+The plausible and clinical limits are in [`terminology.rs`](crates/medcrypto-fhir/src/terminology.rs). They are engineering
+defaults for cleaning data and **are not clinical reference ranges**, so review them for your deployment. A code not in the
+catalog is refused rather than passed through unnormalized.
+
+### What the client refuses
+
+The server is trusted with nothing beyond its own data.
+
+- `http://`, unless the host is the local machine or `--allow-insecure-http` is given.
+- A `next` link to any other origin, checked before anything is sent, so that a hostile response cannot collect the bearer
+  token or reach internal addresses.
+- Redirects, which could carry the token somewhere unchecked.
+- URLs with embedded credentials.
+- More than 1000 pages, or a page over 256 MiB.
+
+---
+
+## 11. Zero-knowledge proofs and post-quantum backends
+
+Everything goes through one small interface, so the proof system can be swapped without touching what uses it:
+
+```rust
+pub trait ZkPredicateProver {
+    fn prove_range(&self, val: u64, min: u64, max: u64) -> Result<ZkProof, CryptoError>;
+    fn verify_range(&self, proof: &ZkProof, min: u64, max: u64) -> bool;
+}
+```
+
+| Backend | Assumption | Post-quantum | Size | Needs | Use |
+| :--- | :--- | :--- | ---: | :--- | :--- |
+| `PedersenBackend` | Discrete logarithm on ristretto255 | No | 2.2 KiB | Nothing | Development and testing inside a hospital |
+| `HashBasedBackend` | SHA-256 only | Yes | 1.3 MB | Nothing | Production |
+| `StarkCoprocessorBackend` | Depends on the prover, typically hash-based | If the runner is | Depends on the prover | An external runner and guest program | Where proofs must be small |
+
+`--profile production` refuses `PedersenBackend`, by way of `backend_for_profile`.
+
+### How the hash-based range proof works
+
+[`range_proof.rs`](crates/medcrypto-pq/src/range_proof.rs) uses MPC in the head, in the style of ZKBoo. The commitment is
+`SHA-256("mcrange1" || value || blinding)`, and the statement is that the prover knows a value and blinding with that hash, and that
+`min <= value <= max`.
+
+The prover splits its secret into three random shares that XOR to it, and imagines three parties computing the whole statement
+between them: all 64 rounds of SHA-256, and the two 64-bit comparisons. XOR gates are local. Each AND gate has a party combine its
+own share with the next party's and with random tape, so that any two parties' views together say nothing about the secret, while all
+three are needed to compute it.
+
+The prover commits to all three views, and a hash of everything picks two to open (Fiat-Shamir). If the prover cheated anywhere,
+at least one of the three pairs is inconsistent, so each round catches it with probability at least 1/3. With 438 rounds, the chance
+of getting through is `(2/3)^438`, about `2^-256`. Grover's algorithm square-roots a search for lucky challenges, which leaves about
+128 bits. Tests run a cheating prover through the same protocol, and it fails.
+
+It needs nothing external, and makes no assumption beyond the hash. The price is size, because the proof holds a transcript of the circuit for each round.
+
+### How the Pedersen range proof works
+
+To prove `min <= v <= max` for the `v` in a commitment `C = v G + r H`, the prover writes both `a = v - min` and
+`b = max - v` as `n` bits, with `n` enough for `max - min`.
+
+1. Each bit gets a commitment `C_i = bit * G + r_i * H`, and a one-of-two Schnorr proof that it opens to 0 or 1. The branch that
+   is false gets simulated, so the proof does not reveal which bit it is.
+2. The blindings are chosen so that the bit commitments add up: `sum(2^i C_a,i) = C - min G` and `sum(2^i C_b,i) = max G - C`.
+3. All challenges come from SHA-512 over the commitment, range, bit index and side (Fiat-Shamir).
+
+Since `a` and `b` are both non-negative integers far below the group order, wrapping around is impossible, and the two
+together pin `v` to the range. `H` comes from a hash, so nobody knows its discrete logarithm relative to `G`. Proof size is
+`2n * 160` bytes plus framing. That is 2.2 KiB for `[0, 65]` and 10 KiB for a 32-bit range.
+
+### The STARK runner protocol
+
+The adapter talks to a separate executable with JSON over pipes. The witness goes over standard input, because command
+lines are visible to other processes.
+
+```text
+runner info                     -> {"system": "...", "post_quantum": true, "zero_knowledge": true}
+runner prove  --elf GUEST.elf   <- {"value": 58, "min": 0, "max": 65}
+                                -> {"commitment": "hex", "proof": "hex"}
+runner verify --elf GUEST.elf   <- {"commitment": "hex", "proof": "hex", "min": 0, "max": 65}
+                                -> {"valid": true}
+```
+
+Rules the adapter enforces, all failing closed:
+
+- A runner must declare **both** `post_quantum` and `zero_knowledge`. Being a STARK does not by itself make a proof
+  zero-knowledge. Many zkVM proofs are only succinct, so a proof could leak the very value it is about, and wrapping one in a
+  Groth16 proof to hide it brings the elliptic curves back. **Check this property for the system you choose.**
+- A proof is tied to the SHA-256 of one exact guest program.
+- If the runner is missing, broken or times out, verification returns `false`.
+
+---
+
+## 12. The consortium daemon
+
+### What happens, step by step
+
+```text
+ 1. Key generation     All nodes, once.
+                       Publish public shares, send each other node a secret share.
+                       Persist the key share and the collective keys.
+
+ 2. Trigger            A node's consent source reports the study's epoch as active.
+
+ 3. Contribution       Each participant: read its table, keep patients whose consent covers
+                       the scope, encrypt, write a marker, send to everyone.
+
+ 4. Aggregation        With all participants' cohorts: merge in a fixed order, sum the slots.
+                       This is deterministic, so honest nodes get identical bytes.
+                       Announce the hash of the result.
+
+ 5. Release: counts    When k nodes announce the same hash, the lowest k of them publish partial
+                       decryptions of the counts. The study's approval is checked again first.
+
+ 6. Release: sums      For analytes with count >= min_cell_size, the same step for the sums.
+                       Others are suppressed.
+
+ 7. Result             Write results/<job>.json, and append to the audit chain.
+```
+
+The job's identifier comes from the study's `id` and `epoch`, so all nodes derive it independently. Rerunning a study means
+a new epoch.
+
+Messages may arrive in any order. A partial decryption that arrives before its aggregate is stored until that is ready. Delivery to a peer that is down retries for up to an hour.
+
+### Trust checks on every message
+
+1. **TLS.** The peer's certificate has to chain to the consortium's CA, on both sides of the connection. Key exchange is hybrid
+   X25519 and ML-KEM-768, so that traffic recorded today stays private from a quantum computer later, and a test confirms
+   this by handshaking with a running daemon while offering nothing else.
+2. **Roster.** The certificate's SHA-256 has to be the one the roster lists for the claimed sender, so even the CA cannot add a
+   member without changing every node's roster.
+3. **Signatures.** Both an Ed25519 and an ML-DSA-65 signature have to cover the consortium, sender, recipient and payload hash, so
+   a recorded message cannot be replayed to another node or another consortium.
+4. **Protocol.** A share or partial decryption has to be from the party it claims. Ciphertexts are fully validated, including
+   that every residue is below its prime, before anything uses them.
+
+The gRPC service is defined in [`proto/consortium.proto`](proto/consortium.proto), and compiles with no `protoc`.
+
+### Hybrid signatures
+
+[`signatures.rs`](crates/medcrypto-pq/src/signatures.rs) signs each message with both Ed25519 and ML-DSA-65 (FIPS 204), and verification needs both.
+
+- ML-DSA is what holds against a quantum computer, since Ed25519 falls to Shor's algorithm.
+- Ed25519 stays because ML-DSA is young. If a flaw turns up in it, or in this implementation, a forgery still means breaking
+  Ed25519 too. Removing or replacing either half of a signature makes it invalid.
+- One 32-byte seed makes both keys, through separate derivations, and a context string is bound into what gets signed.
+
+ML-DSA comes from the [`fips204`](https://crates.io/crates/fips204) crate, whose key generation a test checks against NIST's ACVP
+vector. A signature is 64 + 3309 bytes, and a public key is 32 + 1952. Signing takes 0.24 ms and verifying 0.10 ms, so this adds
+little to any message here.
+
+The same signatures work on files:
+
+```bash
+M=./target/release/medcrypto
+$M sign-keygen --output-dir sign
+$M sign --key sign/signing-key.hex --input results.json --output results.sig
+$M verify-signature --public-key sign/signing-public.json --input results.json --signature results.sig
+```
+
+### Privacy checks
+
+- **Consent, per patient,** at contribution time. A failed lookup counts as no.
+- **Study approval,** before any work starts, and again before each partial decryption. So a study withdrawn after
+  contributions have been made is never decrypted, which a test confirms.
+- **Hash agreement,** so nodes that computed different totals do not count towards the threshold.
+- **Only totals are decrypted.** `sum_slots` removes individual values before any partial decryption exists.
+- **Minimum cell size,** which suppresses results from too few patients. The conventional 11 is a common starting point for
+  health statistics. Decide on yours with your compliance team.
+
+### Consent sources
+
+**A file** (`type: file`), read fresh on every lookup, so a revocation takes effect immediately. Whoever can write that file
+controls consent, so it suits tests and deployments with their own access control.
+
+**A smart contract** (`type: evm`), with [`contracts/ConsentRegistry.sol`](contracts/ConsentRegistry.sol). The node only makes
+`eth_call`, so it needs no wallet and pays nothing. Identifiers go on chain as Keccak-256 hashes, so no health information does.
+Set it in `node.json`:
+
+```json
+"consent": {
+  "type": "evm",
+  "rpc_url": "https://your-node.example",
+  "contract": "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+}
+```
+
+Remote RPC has to use https. A response that is empty, a revert or anything but exactly `true` counts as no.
+
+### Keys from older versions
+
+Nothing has to be regenerated. Key shares, collective keys, certificates and identities all carry over, and every format here reads the
+versions before it.
+
+- **0.3.x** rosters work as they are.
+- **0.2.x** rosters list Ed25519 alone. A node on one keeps working, with the same key, signing the way that version did, so that
+  old and new nodes can run side by side during an upgrade. Each node's seed file also yields an ML-DSA key.
+
+To bring a 0.2.x consortium up to hybrid signatures, once all nodes run this version:
+
+```bash
+# At each hospital. The output holds only public keys.
+$M consortium-export-key --config consortium/hospital-a/node.json --output hospital-a.key.json
+
+# Once, with all of them, and then give every node the new roster.
+$M consortium-import-keys --roster consortium/roster.json hospital-a.key.json hospital-b.key.json hospital-c.key.json
+```
+
+An import can only add a key to a node with the same Ed25519 key, so it cannot take over another node's identity. And an entry with an
+ML-DSA key never again accepts Ed25519 alone, so nothing can downgrade it. A test runs a study on an old roster, upgrades it, runs another,
+and checks that the key shares have not changed by a byte.
+
+File formats from 0.2.0 on read as they are. Wasm export names did change with this version, from `@0.2.0` to `@0.4.0`, so hosts that name
+them have to update that string. The keys and ciphertexts themselves are unchanged.
+
+---
+
+## 13. Threshold decryption
+
+Each party `i` draws its own ternary secret `s_i`. The collective secret `s = sum(s_i)` is never assembled anywhere.
+
+**Key generation** has two parts, each one round:
+
+- Public: for a common random `a` derived from a public seed, each party publishes `b_i = -a s_i + e_i`. The sum gives a public
+  key for `s`. The same trick gives Galois keys, because a key-switching key for a rotation is linear in the secret.
+- Secret: each party Shamir-shares `s_i` to all parties, over the ciphertext modulus and in the NTT domain, which works because
+  Shamir sharing is linear. A party's final share is the sum of what it received.
+
+Relinearization keys are **not** generated collectively. They are not linear in the secret and take an extra round. This
+protocol does not need them, because statistics take only additions and rotations.
+
+**Decryption.** For a set `T` of exactly `k` parties, each publishes
+
+```text
+d_j = lambda_j * share_j * c1 + smudge_j
+```
+
+where `lambda_j` is the Lagrange coefficient for `T`. Then `c0 + sum(d_j)` is the message plus a little noise.
+
+The Lagrange coefficient has to be applied before the noise is added, since it is huge modulo `Q` and would amplify any noise
+added earlier. That is why a partial decryption names its set, and why `T` is chosen deterministically, as the lowest `k` of
+those who announced the same hash.
+
+**Smudging noise.** Each party adds noise uniform in `[-2^b, 2^b)`. The default `b = 24`, in the roster's
+`smudging_bits`, masks the ciphertext error term while leaving about `2^-9` of absolute noise per party in a decoded value, at scale `2^40` and `N = 8192`.
+
+BFV holds its message in the high bits, far above this noise, so it uses `b = 50` with no effect on the exact result, in
+`BFV_SMUDGING_BITS`.
+
+---
+
+## 14. WebAssembly Component
+
+[`component/`](component) packages the cryptography as one
+[WebAssembly Component](https://component-model.bytecodealliance.org/). There is one `medcrypto.wasm`, attached to each
+[release](https://github.com/Aetherx86/medcrypto/releases/latest), with its interface in
+[`component/wit/medcrypto.wit`](component/wit/medcrypto.wit). No language-specific C bindings are involved.
+
+### The `api` interface
+
+| Function | What it is | Checked against |
+| :--- | :--- | :--- |
+| `sha256` | SHA-256 | FIPS 180 |
+| `hkdf` | HKDF-SHA-256 key derivation | RFC 5869 |
+| `seal`, `open` | AES-256-GCM authenticated encryption | NIST vectors |
+| `keypair-from-seed`, `sign`, `verify` | Ed25519 signatures | RFC 8032 |
+| `merkle-root` | Merkle tree with separate leaf and node hashes | RFC 6962 reference data |
+| `audit-link` | One link of a tamper-evident audit chain | Own tests |
+| `constant-time-equal` | Comparison whose time does not depend on the contents | Own tests |
+
+### The `fhe-ops` interface
+
+```wit
+interface fhe-ops {
+    record fhe-keypair { public-key: list<u8>, secret-key: list<u8> }
+    record ciphertext { data: list<u8>, degree: u32, scale: f64 }
+
+    keygen: func(entropy: list<u8>) -> result<fhe-keypair, fhe-error>;
+    encrypt-vector: func(pk: list<u8>, values: list<f64>, entropy: list<u8>) -> result<ciphertext, fhe-error>;
+    decrypt-vector: func(sk: list<u8>, a: ciphertext) -> result<list<f64>, fhe-error>;
+    homomorphic-add: func(a: ciphertext, b: ciphertext) -> result<ciphertext, fhe-error>;
+    homomorphic-scalar-mul: func(a: ciphertext, scalar: f64) -> result<ciphertext, fhe-error>;
+}
+```
+
+This runs CKKS at `N = 8192`. It differs from the roadmap's sketch in three ways, on purpose: `encrypt-vector` takes `entropy`, because
+this component has no random source; functions return `result`, because input can be bad; and `keygen` and `decrypt-vector` are
+added, since nothing could be used otherwise.
+
+### The `bfv-ops` and `pq-signatures` interfaces
+
+```wit
+interface bfv-ops {
+    record bfv-ciphertext { data: list<u8>, degree: u32, plain-modulus: u64 }
+
+    keygen: func(entropy: list<u8>) -> result<fhe-keypair, fhe-error>;
+    relin-keygen: func(sk: list<u8>, entropy: list<u8>) -> result<list<u8>, fhe-error>;
+    encrypt: func(pk: list<u8>, plain-bits: u32, values: list<s64>, entropy: list<u8>) -> result<bfv-ciphertext, fhe-error>;
+    decrypt: func(sk: list<u8>, a: bfv-ciphertext) -> result<list<s64>, fhe-error>;
+    add: func(a: bfv-ciphertext, b: bfv-ciphertext) -> result<bfv-ciphertext, fhe-error>;
+    multiply: func(a: bfv-ciphertext, b: bfv-ciphertext, relin-key: list<u8>) -> result<bfv-ciphertext, fhe-error>;
+    noise-budget: func(sk: list<u8>, a: bfv-ciphertext) -> result<f64, fhe-error>;
+}
+
+interface pq-signatures {
+    record hybrid-public-key { ed25519: list<u8>, ml-dsa65: list<u8> }
+    record hybrid-signature { ed25519: list<u8>, ml-dsa65: list<u8> }
+
+    public-key-from-seed: func(seed: list<u8>) -> result<hybrid-public-key, crypto-error>;
+    sign: func(seed: list<u8>, context: list<u8>, message: list<u8>, entropy: list<u8>) -> result<hybrid-signature, crypto-error>;
+    verify: func(public-key: hybrid-public-key, context: list<u8>, message: list<u8>, signature: hybrid-signature) -> bool;
+}
+```
+
+**It imports nothing.** The component has no file, clock, network or random access, which CI checks on every build, so whatever a
+bug in it could do is limited to computing a wrong answer. Because of that, randomness has to come from the caller. Pass 32 fresh
+bytes from a cryptographic source to `keygen` and to each `encrypt-vector`, and never reuse them. All zeros is refused,
+since that is what a broken random source tends to produce.
+
+### From each language
+
+```python
+# Python, with wasmtime
+pair = m.fhe_call("keygen", secrets.token_bytes(32))
+public = bytes(getattr(pair, "public-key"))
+secret = bytes(getattr(pair, "secret-key"))
+a = m.fhe_call("encrypt-vector", public, [120.5, 80.0, 5.75], secrets.token_bytes(32))
+b = m.fhe_call("encrypt-vector", public, [10.0, 20.0, 0.25], secrets.token_bytes(32))
+print(m.fhe_call("decrypt-vector", secret, m.fhe_call("homomorphic-add", a, b)))
+
+# Exact integers
+pair = m.bfv_call("keygen", secrets.token_bytes(32))
+public = bytes(getattr(pair, "public-key"))
+secret = bytes(getattr(pair, "secret-key"))
+a = m.bfv_call("encrypt", public, 20, [1000, -2000, 3], secrets.token_bytes(32))
+print(m.bfv_call("decrypt", secret, m.bfv_call("add", a, a)))   # [2000, -4000, 6]
+
+# A post-quantum signature
+seed = secrets.token_bytes(32)
+public = m.pq_call("public-key-from-seed", seed)
+signature = m.pq_call("sign", seed, b"release", b"count: 1500", secrets.token_bytes(32))
+print(m.pq_call("verify", public, b"release", b"count: 1500", signature))   # True
+```
+
+```javascript
+// TypeScript or JavaScript, through jco
+import { fheOps } from "./generated/medcrypto.js";
+const random = () => crypto.getRandomValues(new Uint8Array(32));
+const { publicKey, secretKey } = fheOps.keygen(random());
+const a = fheOps.encryptVector(publicKey, Float64Array.of(120.5, 80.0, 5.75), random());
+const doubled = fheOps.homomorphicScalarMul(a, 2.0);
+console.log(fheOps.decryptVector(secretKey, doubled));
+
+// Exact integers, as BigInt
+const keys = bfvOps.keygen(random());
+const x = bfvOps.encrypt(keys.publicKey, 20, BigInt64Array.of(1000n, -2000n, 3n), random());
+console.log(bfvOps.decrypt(keys.secretKey, bfvOps.add(x, x)));
+
+// A post-quantum signature
+const seed = random();
+const signature = pqSignatures.sign(seed, text("release"), text("count: 1500"), random());
+console.log(pqSignatures.verify(pqSignatures.publicKeyFromSeed(seed), text("release"), text("count: 1500"), signature));
+```
+
+The hosts in `component/hosts/` each run the same file and have to print exactly
+[`expected.txt`](component/hosts/expected.txt), and a native test checks that file against the Rust code:
+
+```bash
+sh component/build.sh     # Needs the wasm32-unknown-unknown target and wasm-tools.
+
+# Python
+pip install -r component/hosts/python/requirements.txt
+python component/hosts/python/run.py component/dist/medcrypto.wasm
+
+# TypeScript
+cd component/hosts/typescript && npm ci --ignore-scripts && npm run transpile && node run.mjs
+
+# Go
+cd component/hosts/go && go run . ../../dist/medcrypto.wasm
+```
+
+Python and TypeScript use real component runtimes (`wasmtime` and `jco`). Go has no mature one yet, so the Go host uses `wazero` to
+run the core module inside the component file, and handles the Canonical ABI by hand. That is the same compiled code, but it
+is more work, and it only works this simply because the component has no imports. Those hosts also show how the record's `f64`
+changes the memory layout.
+
+The expected output rounds CKKS values, whose ciphertexts are not compared across platforms, because the floating-point library may
+differ in the last bit between native code and Wasm, which changes rounding in the encoder, though not the decrypted answer. BFV and the
+signatures have no floating point in them, so their bytes are compared exactly, on every platform.
+
+---
+
+## 15. Rust library
+
+From [`examples/readme_tour.rs`](examples/readme_tour.rs), which CI compiles:
+
+```rust
+use medcrypto::compliance::KeyManager;
+use medcrypto::fhe::{BfvEngine, CKKSEngine, CkksPreset};
+use medcrypto::packing::RecordEnvelope;
+use medcrypto::signatures::{verify, HybridSigningKey};
+use medcrypto::zkp::{PedersenBackend, ZKPEngine, ZkPredicateProver};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // N = 8192: 4096 slots, two multiplications, 128 post-quantum bits by the HE Standard's table.
+    let fhe = CKKSEngine::from_preset(CkksPreset::N8192);
+    let (secret, public) = fhe.keygen();
+    let relin = fhe.relin_keygen(&secret);
+    let galois = fhe.galois_keygen(&secret, &fhe.sum_rotation_steps());
+
+    // Slot-wise arithmetic on encrypted vectors.
+    let a = fhe.encrypt(&public, &[1.5, 2.5, 3.5, 4.5])?;
+    let b = fhe.encrypt(&public, &[2.0, 2.0, 2.0, 2.0])?;
+    let product = fhe.multiply_relin_rescale(&a, &b, &relin)?;
+    println!("product: {:.3?}", fhe.decrypt(&secret, &product)?); // [3.0, 5.0, 7.0, 9.0]
+
+    // Rotation moves slots left, and a negative step moves them right.
+    let rotated = fhe.rotate(&a, 1, &galois)?;
+    println!("rotated: {:.3}", fhe.decrypt(&secret, &rotated)?[0]); // 2.5
+
+    // A linear score: sum(weight * feature) + bias, all under encryption.
+    let features = fhe.encrypt(&public, &[54.0, 128.0, 5.8])?;
+    let score = fhe.evaluate_linear_risk_model(&features, &[0.02, 0.01, 0.3], -1.5, &galois)?;
+    println!("score: {:.3}", fhe.decrypt(&secret, &score)?[0]); // 2.6
+
+    // A nonlinear score: a logistic curve, by a cubic approximation.
+    let inputs = fhe.encrypt(&public, &[-2.0, 0.0, 2.0])?;
+    let probability = fhe.evaluate_logistic(&inputs, &relin)?;
+    println!("logistic: {:.3?}", fhe.decrypt(&secret, &probability)?); // About 0.21, 0.5, 0.79
+
+    // A range proof: the verifier learns that the value is in the range, and nothing else about it.
+    let proof = PedersenBackend.prove_range(58, 0, 65)?;
+    assert!(PedersenBackend.verify_range(&proof, 0, 65));
+    let threshold = ZKPEngine::prove_threshold(58, 65, true)?;
+    assert!(ZKPEngine::verify_threshold(&threshold));
+
+    // An envelope that can be erased by destroying its key.
+    let mut keys = KeyManager::new();
+    let names = vec!["hba1c".to_string(), "glucose".to_string()];
+    let envelope = RecordEnvelope::seal(&fhe, &public, &mut keys, "patient-1", names, &[5.9, 108.0])?;
+    assert!(envelope.open(&fhe, &keys).is_ok());
+    keys.shred_key(&envelope.envelope.key_id, "patient-1")?;
+    assert!(envelope.open(&fhe, &keys).is_err());
+
+    // BFV: exact integers, for counts and anything else that must not be approximate.
+    let bfv = BfvEngine::new(CkksPreset::N8192, 20)?;
+    let (bfv_secret, bfv_public) = bfv.keygen();
+    let bfv_relin = bfv.relin_keygen(&bfv_secret);
+    let x = bfv.encrypt(&bfv_public, &[1000, -2000, 3])?;
+    let y = bfv.encrypt(&bfv_public, &[5, 60, -7])?;
+    let exact = bfv.multiply_relin(&x, &y, &bfv_relin)?;
+    println!("exact: {:?}", bfv.decrypt(&bfv_secret, &exact)?); // [5000, -120000, -21]
+
+    // A hybrid signature: both Ed25519 and ML-DSA-65 have to hold.
+    let signer = HybridSigningKey::generate();
+    let signature = signer.sign(b"release", b"count: 1500")?;
+    assert!(verify(signer.public_key(), b"release", b"count: 1500", &signature));
+    assert!(!verify(signer.public_key(), b"release", b"count: 1501", &signature));
+    Ok(())
+}
+```
+
+`medcrypto::fhe` is the `medcrypto-fhe` crate, and `medcrypto::fhir` is `medcrypto-fhir`. Every function that needs randomness has a
+`_with` form taking your own generator, and that is the only form when the crate is built without its `os-rng` feature.
+
+Input from anywhere else goes through `validate_ciphertext`, `validate_public_key`, `validate_secret_key` and the like before use.
+Secret keys and shares wipe their memory when dropped, and print no key material in debug output.
+
+---
+
+## 16. Cryptographic security architecture
+
+### Protection matrix
+
+| Threat vector | Protection mechanism |
+| :--- | :--- |
+| Network interception | Mutual TLS with hybrid X25519 and ML-KEM-768 key exchange |
+| Cross-institution patient exposure | Only ciphertexts are exchanged, and `sum_slots` collapses individual slots before threshold decryption |
+| Sub-threshold key compromise | Shamir secret sharing over NTT residues requires at least `k` of `n` nodes to decrypt |
+| Unauthorized consortium peers | Certificate authority validation, SHA-256 roster pinning, and dual Ed25519 + ML-DSA-65 message signatures |
+| Audit log tampering | Hash-chained audit log entries per node |
+| Post-erasure ciphertext access | Per-record AES-256-GCM envelope keys destroyed upon `shred` |
+| Range predicate verification | Zero-knowledge range proofs revealing only range membership |
+
+### Post-quantum cryptographic primitives
+
+| Component | Cryptographic foundation | Quantum security level |
+| :--- | :--- | :--- |
+| CKKS and BFV at `N8192` / `N16384` | Ring Learning With Errors (RLWE) | 128 bits per the Homomorphic Encryption Standard |
+| Consortium and file signatures | Hybrid ML-DSA-65 (FIPS 204) + Ed25519 | 128+ post-quantum bits |
+| TLS key exchange | Hybrid X25519 + ML-KEM-768 (FIPS 203) | 128+ post-quantum bits |
+| Production range proofs (`HashBasedBackend`) | SHA-256 MPC-in-the-head (438 rounds) | 128 bits under Grover |
+| Audit chains and record envelopes | SHA-256 and AES-256-GCM | 128 bits under Grover |
+
+---
+
+### 16.5 Operational scope and architectural boundaries
+
+- **Approximate fixed-point arithmetic**: CKKS operates over scaled fixed-point encodings ($\Delta = 2^{40}$). Each rescaled multiplication consumes one prime from the RNS modulus chain (`q_L`), requiring parameter selection or bootstrapping when evaluating deeper polynomial circuits.
+- **Threshold quorum trust model**: Distributed decryption (`t`-of-`n` Shamir secret sharing with smudging noise) protects secret key shares as long as fewer than `t` consortium nodes collude.
+- **Hybrid classical and post-quantum primitives**: Ciphertext encryption (RLWE) and STARK commitments rely on lattice and hash-based assumptions, whereas Bulletproofs range proofs (`Ristretto255`) and enclave signatures (`Ed25519`) use standard elliptic-curve cryptography.
+
+## 17. Regulatory mapping
+
+| Clause | Requirement | Technical measure |
+| :--- | :--- | :--- |
+| GDPR Art. 5(1)(c) | Data minimization | Only study analytes are contributed, and only aggregate totals are decrypted |
+| GDPR Art. 7 | Conditions for consent | Per-patient consent checks prior to contribution and before partial decryption |
+| GDPR Art. 9 | Special category data | Homomorphic encryption before leaving the hospital boundary |
+| GDPR Art. 17 | Right to erasure | Per-record envelope keys destroyed on request via cryptographic shredding |
+| GDPR Art. 25 | Data protection by design | HMAC-SHA256 pseudonyms, encryption, threshold keys, and cell-size suppression |
+| GDPR Art. 32 | Security of processing | Mutual TLS, hybrid post-quantum signatures, and roster pinning |
+| HIPAA 164.502(b) | Minimum necessary | Zero-knowledge range proofs verify predicates without disclosing values |
+| HIPAA 164.514 | De-identification | Site-keyed HMAC-SHA256 pseudonyms and pseudonym-sorted cohort slots |
+| HIPAA 164.528 | Accounting of disclosures | Hash-chained audit log per node |
+| HIPAA 164.312 | Technical safeguards | Mutual TLS and cryptographic per-node identity |
+
+Legal notes are in [LEGAL.md](LEGAL.md).
+
+---
+
+## 18. Performance
+
+Measured on an Apple M4 in release mode, on one thread, with `cargo run --release --example fhe_benchmark`. Your numbers
+will differ, so run it.
+
+| Operation | `N = 8192` (ms) | `N = 16384` (ms) |
+| :--- | ---: | ---: |
+| Key generation | 1.16 | 7.20 |
+| Relinearization key | 7.69 | 42.67 |
+| One rotation key | 11.99 | 40.22 |
+| Encrypt, all slots | 2.19 | 8.36 |
+| Decrypt | 11.26 | 56.17 |
+| Add | 0.02 | 0.09 |
+| Multiply | 0.14 | 0.69 |
+| Relinearize | 2.27 | 22.40 |
+| Rescale | 0.54 | 3.33 |
+| Rotate | 2.29 | 26.67 |
+| Sum all slots | 28.84 | 370.85 |
+
+| Size | `N = 8192` | `N = 16384` |
+| :--- | ---: | ---: |
+| Ciphertext, binary | 384 KiB | 2048 KiB |
+| Ciphertext, in a JSON file | about 770 KiB | about 4 MiB |
+| Public key | 384 KiB | 2048 KiB |
+| Relinearization key | 1.5 MiB | 18 MiB |
+| Rotation keys for `sum_slots` | 18 MiB | 234 MiB |
+
+| BFV, 20-bit `t` | `N = 8192` (ms) | `N = 16384` (ms) |
+| :--- | ---: | ---: |
+| Encrypt, all slots | 1.15 | 5.38 |
+| Decrypt | 2.59 | 21.68 |
+| Add | 0.01 | 0.07 |
+| Multiply by plaintext | 0.29 | 1.42 |
+| Multiply | 12.33 | 103.74 |
+| Relinearize | 1.56 | 15.75 |
+| Sum all slots | 20.65 | 222.42 |
+
+| Hybrid signature | Time (ms) | Size |
+| :--- | ---: | ---: |
+| Key generation | 0.13 | Public key 1984 bytes |
+| Sign | 0.24 | Signature 3373 bytes |
+| Verify | 0.10 | - |
+
+| Range proof | Prove (ms) | Verify (ms) | Size |
+| :--- | ---: | ---: | ---: |
+| Pedersen, `[0, 65]` | 2.04 | 1.91 | 2.2 KiB |
+| Pedersen, 32-bit range | 8.82 | 9.21 | 10 KiB |
+| Hash-based, any range | 38 | 45 | 1.3 MB |
+
+The three-node tutorial, with 1500 patients and 3 analytes, finished key generation and the study within tens of seconds on one laptop. In a real deployment, the bandwidth dominates: each participant sends `3 x analytes x batches` ciphertexts to each
+other node, and each node sends its share of the rotation keys during key generation.
+
+---
+
+## 19. Command reference
+
+Run any of these with `--help` for all of its options.
+
+| Command | What it does |
+| :--- | :--- |
+| `gui` | The desktop GUI. Also what runs with no command at all |
+| `demo` | The whole multi-hospital flow on synthetic data |
+| `init-node` | Shows a node's DID and parameters, with a throwaway key |
+| `keygen` | Writes a secret key, public key, rotation keys and relinearization key |
+| `encrypt` | Encrypts one patient's vitals |
+| `decrypt` | Decrypts a ciphertext file |
+| `bfv-encrypt`, `bfv-decrypt` | Encrypts integers with BFV, and decrypts them exactly, reporting the noise budget |
+| `ingest-fhir` | FHIR server or bundle, to vertical ciphertexts, horizontal envelopes, or a plain table |
+| `batch-pack` | A directory of `PatientRecord` files or bundles, to vertical ciphertexts |
+| `cohort-merge` | Combines several sites' cohorts |
+| `cohort-stats` | Count, mean and deviation, with one secret key |
+| `pack-record` | One record into an erasable envelope |
+| `open-record` | Opens and decrypts an envelope, if its key exists |
+| `shred` | Destroys a record's key |
+| `prove`, `verify` | Range proofs with either backend |
+| `sign-keygen` | Writes a hybrid Ed25519 and ML-DSA-65 signing key |
+| `sign`, `verify-signature` | Signs a file and checks it, with both algorithms |
+| `quantum-audit` | Checks parameters against the HE Standard |
+| `consortium-init` | Creates a CA, certificates, keys, a roster and node configurations |
+| `consortium-export-key`, `consortium-import-keys` | Brings a roster from before 0.3.0 up to hybrid signatures, with no new keys |
+| `daemon run` | Runs a node until interrupted |
+| `daemon status` | Asks a node how it is doing |
+
+Options for `ingest-fhir`:
+
+| Option | Default | Meaning |
+| :--- | :--- | :--- |
+| `--endpoint`, `--bundle` | - | A FHIR server base URL, or a bundle file. Exactly one |
+| `--loinc-filter` | Required | Comma-separated LOINC codes |
+| `--mode` | `vertical` | `vertical`, `horizontal` or `table` |
+| `--output` | Required | Output file |
+| `--batch-size` | 4096 | Patients per ciphertext, up to the slot count |
+| `--winsorize` | `clinical` | `clinical`, `p1p99` or `off` |
+| `--impute` | `none` | `none`, `median` or `mean` |
+| `--public-key` | New keys next to the output | Public key file |
+| `--pseudonym-key` | Next to the output | The site's secret, created if missing |
+| `--key-store` | `medcrypto-keystore.json` | Envelope keys, for horizontal mode |
+| `--allow-insecure-http` | Off | Allow `http://` to a remote host |
+| `--scheme` | `ckks` | `ckks`, or `bfv` for exact results. Also on `batch-pack` |
+| `--fixed-point` | 10 | For BFV: what values are multiplied by, so 10 keeps one decimal |
+| `--plain-bits` | 50 | For BFV: the size of the plaintext modulus |
+
+Exit status is 0 on success and 1 on any error, including a proof that fails to verify, and 126 for a license problem.
+
+---
+
+## 20. File formats
+
+Binary formats use postcard, and JSON files hold polynomials as hexadecimal strings. Nothing here is a stable format
+between minor versions before 1.0.
+
+### A keys directory
+
+| File | Secret | Contents |
+| :--- | :--- | :--- |
+| `secret-key.json` | **Yes**, written mode 0600 | The ternary secret |
+| `public-key.json` | No | For encrypting |
+| `galois-keys.json` | No | For `sum_slots` |
+| `relin-key.json` | No | For multiplication |
+
+**A cohort file** (`--mode vertical`)
+
+```json
+{
+  "format": "medcrypto-cohort-v1",
+  "param_id": 1234567890,
+  "batch_size": 4096,
+  "columns": [{
+    "column": {"analyte": "hba1c", "display": "Hemoglobin A1c (NGSP)", "unit": "%"},
+    "batches": [{"values": {}, "squares": {}, "presence": {}}]
+  }],
+  "quality": [{"analyte": "hba1c", "observations": 400, "unknown_unit": 0, "implausible": 0,
+               "winsorized": 0, "missing": 0, "imputed": 0}]
+}
+```
+
+A BFV cohort has the same shape, with `"format": "medcrypto-bfv-cohort-v1"`, and adds `plain_bits`, `plain_modulus` and `fixed_point`.
+
+**A table** (`--mode table`, kept at the hospital)
+
+```json
+{
+  "columns": [{"analyte": "hba1c", "display": "...", "unit": "%"}],
+  "rows": [{"pseudo_id": "did:med:patient:...", "values": [5.8]}],
+  "quality": []
+}
+```
+
+#### A node's data directory
+
+| Path | Contents | Sensitive |
+| :--- | :--- | :--- |
+| `cohorts/<study>.json` | The plain table, which you put there | **Yes** |
+| `threshold-share.bin` | This node's share of the secret | **Yes** |
+| `collective-keys.bin` | Public keys | No |
+| `jobs/<job>.started` | Marker that this node contributed | No |
+| `results/<job>.json` | Released statistics | Aggregates only |
+| `audit.json` | The hash chain | Metadata |
+
+#### A consent ledger
+
+```json
+{
+  "studies": [{"id": "diabetes-2026", "epoch": 1, "active": true}],
+  "consents": [{"patient": "did:med:patient:...", "scope": "DIABETES_STATISTICS",
+                "valid_until": 1830000000, "active": true}]
+}
+```
+
+---
+
+## 21. Clinical AI module and the GUI
+
+[`src/clinical_ai`](src/clinical_ai/mod.rs) implements a longitudinal medication recommender drawing on VITA (AAAI 2024) and COGNet (SIGIR
+2022): relevant past-visit selection, visit-level attention, copy-or-generate prediction, and DDI drug-interaction suppression.
+
+```bash
+cargo run --example clinical_ai_benchmark
+```
+
+**The GUI** is a native desktop app with `egui`, with no web view:
+
+```bash
+./target/release/medcrypto gui
+```
+
+It has tabs for consent, encryption, proofs, federated averaging, compliance, the security audit and the clinical AI module.
+
+---
+
+## 22. Repository layout
+
+```text
+medcrypto/
+├── crates/
+│   ├── medcrypto-fhe/        RNS-CKKS, RNS-BFV and threshold decryption. No OS dependency without os-rng
+│   ├── medcrypto-fhir/       FHIR parsing, terminology, cleaning, HTTP client
+│   └── medcrypto-pq/         Hybrid signatures and hash-based range proofs. No OS dependency without os-rng
+├── src/
+│   ├── main.rs               The command line
+│   ├── packing/              Horizontal envelopes and vertical cohorts
+│   ├── zkp/                  ZkPredicateProver: Pedersen, hash-based and the STARK adapter
+│   ├── consortium/           Roster, consent sources, protocol state machine, gRPC and TLS
+│   ├── compliance/           Key store, shredding, audit chain
+│   ├── quantum/              The check against the HE Standard
+│   ├── blockchain/           DID and consent simulator, EVM calldata
+│   ├── clinical_ai/          The medication recommender sample
+│   ├── models/               PatientRecord
+│   ├── gui/                  The desktop app
+│   └── license.rs            The license check of the binary
+├── component/                The Wasm Component, its WIT and its Python, TypeScript and Go hosts
+├── proto/consortium.proto    The gRPC service
+├── contracts/                ConsentRegistry.sol
+├── zk/guest-range/           Template guest program for SP1 (not in the workspace)
+├── examples/                 Sample data generator, benchmark, library tour, GUI launcher
+├── tests/                    Integration tests
+└── .github/                  Workflows, and the repository guard
+```
+
+See [DEVELOPER.md](DEVELOPER.md) for working on the code.
+
+---
+
+## 23. Testing and CI/CD
+
+```bash
+cargo test --workspace --all-targets --all-features
+```
+
+The cryptographic crates are built with optimization even in debug mode, so the whole suite takes under a minute or two.
+
+| What | Where | What it establishes |
+| :--- | :--- | :--- |
+| Modular arithmetic | `arith.rs` | Barrett and Shoup agree with plain division. Primes have the required form |
+| NTT | `ntt.rs` | Negacyclic convolution matches schoolbook. The permutation matches the coefficient automorphism |
+| Encoder | `encoder.rs` | Round trips, and ring multiplication is slot multiplication |
+| Parameters | `params.rs` | Presets fit the table. Invalid and overlong chains are refused |
+| CKKS | `crates/medcrypto-fhe/tests/ckks.rs` | Each operation against plaintext, at both presets. Bad input gives an error and not a panic |
+| Threshold | same file | Any `k` of `n` decrypts. Fewer or mixed sets do not. A forged share gives garbage |
+| BFV | `crates/medcrypto-fhe/tests/bfv.rs` | Exact results at both presets, including negatives, wrap-around and multiplying until the budget runs out. Rotation and row swap |
+| FHIR | `crates/medcrypto-fhir/tests` | Parsing, conversion, cleaning, and the client against a real socket, including a hostile `next` link |
+| Packing | `tests/packing_test.rs` | Statistics match plaintext, missing values are excluded, erasure holds across processes |
+| Range proofs | `tests/zkp_range_test.rs` | Honest proofs verify. Tampering and moved commitments fail. Production refuses Pedersen. The runner rules hold |
+| BFV in the daemon | `tests/consortium_test.rs` | A BFV study through real nodes gives identical, exact results on all of them |
+| Daemon | `tests/consortium_test.rs` | Three real nodes over mutual TLS get the right statistics, with consent and cell suppression applied, one node down, and restart from disk. An outside certificate is refused. A study withdrawn midway is not decrypted |
+| Signatures | `crates/medcrypto-pq`, `src/consortium/network.rs` | Key generation matches NIST's vector. Both halves are required. A message with either missing, or replayed elsewhere, is refused. A hybrid entry cannot be downgraded |
+| Hash-based proofs | `crates/medcrypto-pq` | The circuit computes real SHA-256. A prover cheating through the protocol fails. Tampering anywhere fails |
+| Post-quantum TLS | `tests/consortium_test.rs` | A real handshake with a running daemon, offering only X25519MLKEM768 |
+| Key compatibility | `tests/consortium_test.rs`, `tests/cli_test.rs` | A study on a 0.2-format roster, the upgrade, another study, and unchanged key shares |
+| Consent | `tests/evm_consent_test.rs` | ABI encoding, failing closed, and the contract on a real local chain when Foundry is present |
+| Command line | `tests/cli_test.rs` | The documented commands, through the real binary |
+| Wasm | `component/tests/vectors.rs` | Published vectors, and that the expected host output is right |
+
+### GitHub Actions
+
+| Workflow | Trigger | What it does |
+| :--- | :--- | :--- |
+| [`ci.yml`](.github/workflows/ci.yml) | Major tag (`v*.0.0`), manual | Secret scan, repository guard, conflict markers, no emoji in docs. Then on Ubuntu and macOS: format, clippy with warnings denied, tests, `cargo audit`, strict docs, a demo run |
+| [`component.yml`](.github/workflows/component.yml) | Major tag (`v*.0.0`), manual | Builds the Wasm, checks it imports nothing, runs it from Python, TypeScript and Go on Ubuntu and macOS. On a tag: command line archives, build provenance, a release, and a container image on GHCR |
+| [`audit.yml`](.github/workflows/audit.yml) | Major tag (`v*.0.0`), manual | Dependency advisories |
+
+All actions are pinned to commits. The repository guard looks for what supply chain attacks hide in: invisible Unicode, things that run
+without being asked, install hooks and committed credentials. GitLab CI runs format, clippy, tests and audit on the mirror.
+
+Versioning: a fix increments `0.0.X`, and new functionality or platform support increments `0.X.0`. A tag has to match the version in
+`Cargo.toml`, or the release fails. Release notes come from [CHANGELOG.md](CHANGELOG.md).
+
+---
+
+## 24. Roadmap status
+
+| Item | Status | Notes |
+| :--- | :--- | :--- |
+| RNS-CKKS at `N = 8192` and `16384` | Done | Checked against the standard's table |
+| Relinearization, rescaling, rotation | Done | Hybrid key switching and NTT Galois permutation |
+| Nonlinear clinical scoring | Done | Linear, cubic, and logistic evaluation |
+| Horizontal and vertical packing, `batch-pack` | Done | `RecordEnvelope` and `CohortBatch` |
+| FHIR crate, `ingest-fhir` | Done | HL7 FHIR R4, LOINC, UCUM, winsorization, and imputation |
+| `ZkPredicateProver`, Pedersen range proofs | Done | Bit decomposition over `ristretto255` |
+| `StarkCoprocessorBackend` | Done | External JSON-over-stdio prover protocol |
+| Post-quantum range proofs, built in | Done | MPC in the head on SHA-256 |
+| Post-quantum TLS key exchange | Done | X25519MLKEM768 |
+| Daemon over gRPC and mutual TLS | Done | Decentralized multi-hospital coordination |
+| Consent from a smart contract | Done | Solidity `ConsentRegistry.sol` and JSON-RPC verifier |
+| k-of-n key generation and threshold decryption | Done | Distributed Shamir key shares over NTT limbs |
+| Wasm `fhe-ops` | Done | Python, TypeScript and Go |
+| RNS-BFV | Done | Library, threshold decryption, daemon, command line, GUI and Wasm |
+| Hybrid ML-DSA-65 and Ed25519 signatures | Done | On all daemon messages and for files |
+
+---
+
+## 25. Troubleshooting
+
+| Message | Cause | What to do |
+| :--- | :--- | :--- |
+| `[AETHER LICENSE REQUIRED]`, exit 126 | The binary found no license | See [Section 3](#3-install-and-build) |
+| `refusing http:// ... patient data needs https` | A plain remote endpoint | Use https. `--allow-insecure-http` is for testing only |
+| `LOINC code ... is not in the catalog` | A code not in [the catalog](#loinc-catalog) | Add it in `terminology.rs`, with its units |
+| High `Unknown unit` count | A server's unit spelling is new | Check the raw data, then add the spelling |
+| `a coefficient of about 2^N does not fit` | Value too large at this level | Rescale your values, or stay at a higher level |
+| `the scale would overflow` | Multiplying with too little modulus left | Use `N = 16384`, or fewer multiplications |
+| `no levels left` | The budget has run out | Plan the circuit against [the budget](#keeping-scales-straight) |
+| `scales differ` | Adding after different paths | Follow one path, or use `mod_switch_to_level` and `add_constant` |
+| `no Galois key for rotation by N` | That rotation's key was not made | Pass it to `galois_keygen` |
+| `made under different parameters` | Keys and ciphertexts from different presets | Use one preset throughout |
+| Daemon `this certificate is not in the roster` | Rosters differ between nodes | Give all nodes the same `roster.json` |
+| Daemon `this node restarted during the job` | A restart mid-study | Run a new epoch |
+| Job shows as failed, `no longer approved` | The study was withdrawn | Working as intended |
+| Study never starts | Not approved, or the table is missing | Check `consent.json` or the contract, and `data/cohorts/<id>.json`. The daemon logs to standard error |
+
+---
+
+## 26. Glossary
+
+| Term | Meaning |
+| :--- | :--- |
+| CKKS | A homomorphic encryption scheme for approximate arithmetic on real numbers |
+| BFV | A homomorphic encryption scheme for exact arithmetic on integers modulo `t` |
+| Noise budget | How much more noise a BFV ciphertext can take before it decrypts wrongly |
+| ML-DSA | A lattice-based signature scheme standardized as FIPS 204, formerly Dilithium |
+| ML-KEM | A lattice-based key exchange standardized as FIPS 203, formerly Kyber |
+| MPC in the head | Proving a statement by simulating several parties computing it, and opening some of them |
+| RNS | Residue Number System: storing a big number as its residues modulo several small primes |
+| RLWE | Ring Learning With Errors, the lattice problem CKKS's security rests on |
+| `N` | The polynomial ring's degree. Larger is more secure and slower |
+| Slot | A position in a ciphertext's vector. There are `N/2` of them |
+| Level | How many more rescales a ciphertext can take |
+| Scale | The factor that turns real values into integers, here `2^40` |
+| Rescale | Dividing by a prime, after a multiplication, to bring the scale and noise back down |
+| Relinearize | Bringing a product of three polynomials back to two |
+| Galois key | What lets someone rotate slots with no secret key |
+| NTT | Number Theoretic Transform: an FFT over integers, which makes polynomial multiplication fast |
+| Smudging | Noise added to a partial decryption, so that it reveals nothing about the key |
+| DKG | Distributed Key Generation: making a key that nobody ever holds whole |
+| Shamir sharing | Splitting a secret so that any `k` shares rebuild it, and fewer reveal nothing |
+| Pedersen commitment | A commitment to a value that hides it perfectly, and binds under discrete logarithm |
+| STARK | A proof system based on hashes, generally taken as post-quantum |
+| zkVM | A virtual machine whose execution can be proved |
+| FHIR | HL7's standard for exchanging health data. R4 is its widely deployed version |
+| LOINC | Standard codes for lab tests and observations |
+| UCUM | A standard for writing units unambiguously |
+| Winsorization | Clamping extreme values to a limit instead of dropping them |
+| Imputation | Filling in missing values |
+| PHI | Protected Health Information, under HIPAA |
+| mTLS | TLS where both sides prove their identity with certificates |
+
+---
+
+## 27. License
+
+[Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International (CC BY-NC-ND 4.0)](https://creativecommons.org/licenses/by-nc-nd/4.0/).
+Copyright (c) 2026 Jeong Hoon Kim. See [LICENSE](LICENSE) and [LEGAL.md](LEGAL.md).

@@ -1,0 +1,29 @@
+[package]
+name = "medcrypto-pq"
+version = "0.4.0"
+edition = "2021"
+authors = ["Jeong Hoon Kim"]
+license = "CC-BY-NC-ND-4.0"
+description = "Post-quantum building blocks: hybrid ML-DSA-65 and Ed25519 signatures, and hash-based zero-knowledge range proofs"
+publish = false
+
+[features]
+default = ["os-rng"]
+# Lets the convenience functions draw from the operating system. Without it, which is how the Wasm component
+# builds, every function that needs randomness takes bytes from the caller.
+os-rng = ["rand_core/getrandom", "fips204/default-rng"]
+
+[dependencies]
+ed25519-compact = { version = "2.1", default-features = false }
+fips204 = { version = "0.5", default-features = false, features = ["ml-dsa-65"] }
+hex = "0.4"
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+rand_chacha = { version = "0.3", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+sha2 = "0.10"
+zeroize = "1"
+
+[dev-dependencies]
+serde_json = "1"

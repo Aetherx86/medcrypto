@@ -1,0 +1,179 @@
+name: Wasm Component
+
+on:
+  push:
+    tags:
+      - "v*.0.0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build the component
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: python3 .github/scripts/repo_guard.py .
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+        with:
+          tool: wasm-tools
+      - run: sh component/build.sh
+      - name: Check that it imports nothing
+        run: |
+          wasm-tools component wit component/dist/medcrypto.wasm > wit.txt
+          cat wit.txt
+          ! grep -E '^\s*import ' wit.txt
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: component
+          path: component/dist/medcrypto.wasm
+
+  hosts:
+    name: Same binary from ${{ matrix.host }} (${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [python, typescript, go]
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: component
+          path: component/dist
+      - if: matrix.host == 'python'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+      - if: matrix.host == 'typescript'
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+      - if: matrix.host == 'go'
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: component/hosts/go/go.mod
+          cache: false
+      - name: Run and compare
+        shell: bash
+        run: |
+          cd "component/hosts/${{ matrix.host }}"
+          case "${{ matrix.host }}" in
+            python)
+              pip install --disable-pip-version-check -r requirements.txt
+              python run.py ../../dist/medcrypto.wasm > out.txt ;;
+            typescript)
+              # Install scripts are how registry worms get to run, and nothing here needs one.
+              npm ci --ignore-scripts
+              npm run transpile
+              node run.mjs > out.txt ;;
+            go)
+              go run . ../../dist/medcrypto.wasm > out.txt ;;
+          esac
+          diff out.txt ../expected.txt
+
+  binaries:
+    name: Command line for ${{ matrix.name }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: hosts
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x86_64 }
+          - { os: macos-latest, name: macos-aarch64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Build
+        env:
+          NAME: ${{ matrix.name }}
+        run: |
+          cargo build --release --locked --bin medcrypto
+          mkdir -p out
+          tar -czf "out/medcrypto-$NAME.tar.gz" -C target/release medcrypto
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: cli-${{ matrix.name }}
+          path: out/*
+
+  container:
+    name: Container image
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: hosts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build, check and push
+        run: |
+          image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          docker build -t "$image:${GITHUB_REF_NAME#v}" -t "$image:latest" .
+          docker run --rm -e CI=1 "$image:latest" --version
+          docker push "$image:${GITHUB_REF_NAME#v}"
+          docker push "$image:latest"
+
+  release:
+    name: Publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [hosts, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: component
+          path: dist
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: cli-*
+          path: dist
+          merge-multiple: true
+      - name: Check that the tag matches the version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME does not match version $version"; exit 1; }
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/*
+      - name: Create
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist && sha256sum medcrypto.wasm > medcrypto.wasm.sha256 && sha256sum medcrypto-*.tar.gz > SHA256SUMS && cd ..
+          awk -v v="${GITHUB_REF_NAME#v}" '$0 ~ "^## " v {found=1; next} /^## / {found=0} found' CHANGELOG.md > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md --latest --verify-tag

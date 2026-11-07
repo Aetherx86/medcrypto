@@ -1,0 +1,5 @@
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0194", # transitive dependency from eframe -> accesskit -> zbus_xml (requires quick-xml ^0.30)
+    "RUSTSEC-2026-0195", # transitive dependency from eframe -> accesskit -> zbus_xml (requires quick-xml ^0.30)
+]

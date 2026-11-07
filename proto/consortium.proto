@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package medcrypto.consortium.v1;
+
+// What each hospital node serves to the others, over mutual TLS. There is no central server: every node
+// runs this service and is a client of everybody else's.
+service ConsortiumNode {
+  // Hands over one signed protocol message.
+  rpc Deliver(Envelope) returns (Ack);
+  // Where this node has got to, for operators.
+  rpc Status(StatusRequest) returns (StatusReply);
+}
+
+message Envelope {
+  string sender = 1;
+  string recipient = 2;
+  // A protocol message in postcard encoding.
+  bytes payload = 3;
+  // Ed25519 over the consortium, sender, recipient and hash of the payload.
+  bytes signature = 4;
+  // ML-DSA-65 over the same thing. A message needs both to be accepted.
+  bytes pq_signature = 5;
+}
+
+message Ack {}
+
+message StatusRequest {}
+
+message StatusReply {
+  string node_id = 1;
+  bool keys_ready = 2;
+  repeated string jobs_running = 3;
+  repeated string jobs_finished = 4;
+  repeated string jobs_failed = 5;
+}
