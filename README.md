@@ -29,7 +29,9 @@ and only if the patients consented and enough of them are in the result.
 ```
 
 Written in Rust, with one WebAssembly Component for Python, TypeScript and Go. It has two homomorphic schemes, CKKS for
-approximate real numbers and BFV for exact integers, and it signs what nodes send with both ML-DSA-65 and Ed25519.
+approximate real numbers and BFV for exact integers, available in the library, the command line, the daemon and Wasm alike. Against
+quantum computers, it signs with ML-DSA-65 alongside Ed25519, exchanges TLS keys with ML-KEM-768 alongside X25519, and has a
+range proof that rests only on SHA-256.
 
 > **Status.** This is research software, with a real implementation tested end to end. It is not a certified medical
 > device, and using it does not by itself make anyone compliant with HIPAA or GDPR. Read
@@ -95,8 +97,9 @@ HbA1c is at most 6.5%" can be verified without learning that it is 5.8%.
 makes every copy of the record unreadable, including backups of the ciphertext and copies on an immutable ledger.
 
 **Post-quantum** means safe against a future large quantum computer. CKKS and BFV rest on a lattice problem with no known
-efficient quantum attack, and so do ML-DSA signatures. Elliptic curves, which the fast proofs and TLS certificates use, do
-not survive one. This project is clear about which parts are which: see [Section 16](#16-security-model-and-limitations).
+efficient quantum attack, and so do ML-DSA signatures and ML-KEM key exchange. Hash functions survive too, which is what the
+post-quantum range proof rests on. Elliptic curves do not, and the fast Pedersen proofs and TLS certificates still use them. This
+project is clear about which parts are which: see [Section 16](#16-security-model-and-limitations).
 
 ---
 
@@ -105,16 +108,16 @@ not survive one. This project is clear about which parts are which: see [Section
 | Capability | How | Where |
 | :--- | :--- | :--- |
 | Encrypted arithmetic on real vectors | RNS-CKKS at `N = 8192` or `16384`, 128 post-quantum bits by the HE Standard's table | [`crates/medcrypto-fhe`](crates/medcrypto-fhe) |
-| Encrypted arithmetic on exact integers | RNS-BFV on the same primes, with batching into `N` slots | [`bfv.rs`](crates/medcrypto-fhe/src/bfv.rs) |
+| Encrypted arithmetic on exact integers | RNS-BFV on the same primes, with batching into `N` slots, threshold decryption, the daemon, the command line and Wasm | [`bfv.rs`](crates/medcrypto-fhe/src/bfv.rs) |
 | Multiplication, relinearization, rescaling | Hybrid key switching with one digit per prime | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) |
 | Slot rotation | Galois keys, applied by permutation in the NTT domain | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) |
 | Clinical scoring on ciphertexts | Linear models, cubic polynomials, a logistic curve | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) |
 | No single key holder | k-of-n key generation and threshold decryption | [`threshold.rs`](crates/medcrypto-fhe/src/threshold.rs) |
 | EMR input | FHIR R4 parsing, LOINC, UCUM conversion, winsorization, imputation | [`crates/medcrypto-fhir`](crates/medcrypto-fhir) |
 | Per-patient and cohort packing | `RecordEnvelope` and `CohortBatch` | [`src/packing`](src/packing) |
-| Range proofs | Pedersen commitments over ristretto255, swappable for an external prover | [`src/zkp`](src/zkp) |
-| Multi-hospital daemon | gRPC over mutual TLS, signed messages, no central server | [`src/consortium`](src/consortium) |
-| Post-quantum signatures | ML-DSA-65 (FIPS 204) and Ed25519 together, with both required | [`signatures.rs`](src/signatures.rs) |
+| Range proofs | Hash-based and post-quantum, or Pedersen over ristretto255 for speed, or an external prover | [`src/zkp`](src/zkp), [`range_proof.rs`](crates/medcrypto-pq/src/range_proof.rs) |
+| Multi-hospital daemon | gRPC over mutual TLS with hybrid X25519 and ML-KEM-768 key exchange, signed messages, no central server | [`src/consortium`](src/consortium) |
+| Post-quantum signatures | ML-DSA-65 (FIPS 204) and Ed25519 together, with both required | [`signatures.rs`](crates/medcrypto-pq/src/signatures.rs) |
 | Consent | File ledger, or a smart contract through JSON-RPC | [`consent.rs`](src/consortium/consent.rs), [`ConsentRegistry.sol`](contracts/ConsentRegistry.sol) |
 | Erasure and audit | Per-record keys, destroyed on request, with a hash-chained audit log | [`src/compliance`](src/compliance/mod.rs) |
 | Other languages | One Wasm Component with no imports | [`component`](component) |
@@ -123,8 +126,8 @@ not survive one. This project is clear about which parts are which: see [Section
 
 ## 3. Install and build
 
-You need a stable Rust toolchain (tested with 1.99). No `protoc` is needed, because the gRPC definitions compile in pure
-Rust. There is no C library to install for the cryptography.
+You need a stable Rust toolchain (tested with 1.99) and a C compiler, which the TLS library builds with. No `protoc` is needed,
+because the gRPC definitions compile in pure Rust. The homomorphic encryption and proof crates are pure Rust, with no unsafe code.
 
 ```bash
 git clone https://github.com/Aetherx86/medcrypto.git
@@ -349,6 +352,17 @@ cat consortium/hospital-b/data/results/*.json | jq -c '.analytes[]'
 
 Each node also has `data/audit.json`, a hash chain recording what it contributed and released.
 
+**The same study with exact results.** Add a `scheme` to the study, and everything else stays the same: the same collective keys,
+the same 2-of-3 decryption and the same commands. Values become integers by the `fixed_point` factor, so 100 keeps two decimals.
+
+```json
+"scheme": {"type": "bfv", "plain_bits": 50, "fixed_point": 100}
+```
+
+```json
+{"status":"released","analyte":"systolic_bp","unit":"mm[Hg]","count":1000,"mean":135.49024,"variance":425.5489,"standard_deviation":20.6288}
+```
+
 Things to try next: revoke one patient's consent before approving a new epoch and watch the count drop; set
 `min_cell_size` above the cohort and watch the result come back as `suppressed`; stop one daemon after key generation and
 see that the other two still finish a study that has only them as participants.
@@ -413,15 +427,17 @@ The value is scaled to an integer, so 58 here means 5.8%. Use `--lower-bound` fo
 A false claim gets no proof, and editing the threshold in a proof file makes verification fail. The proof is 2,242 bytes
 for this range.
 
-For production, ask for the post-quantum backend. The Pedersen backend is refused there:
+For production, use the post-quantum backend, which rests only on SHA-256. The Pedersen backend is refused there:
 
 ```bash
 $M prove --value 58 --threshold 65 --profile production
-# [ERROR] proof backend: the production profile needs a STARK runner: the Pedersen backend is not post-quantum
+# [ERROR] proof backend: the production profile refuses the Pedersen backend, which is not post-quantum: use the hash backend
 
-$M prove --value 58 --threshold 65 --profile production --backend stark \
-  --guest-elf ./guest.elf --runner ./my-sp1-runner
+$M prove --value 58 --threshold 65 --profile production --backend hash --output pq.json
+$M verify --proof-file pq.json --profile production --backend hash
 ```
+
+That proof takes about 40 ms to make or check, and is 1.3 MB. An external prover can also stand in with `--backend stark`.
 
 ---
 
@@ -544,10 +560,10 @@ so the same line of the standard's table applies.
 | Multiplication limit | Levels, spent by rescaling | A noise budget, with no rescaling |
 | What goes wrong at the limit | Refused, as out of levels | Silently wrong answers, so watch `noise_budget_bits` |
 | What goes wrong on overflow | Refused at encoding | Wraps around modulo `t`, so choose `t` above any result |
-| Used by the daemon | Yes | No: library only for now |
+| Used by the daemon, command line and Wasm | Yes | Yes |
 
 ```rust
-let bfv = BfvEngine::new(CkksPreset::N8192, 20)?;      // A 20-bit plaintext modulus.
+let bfv = BfvEngine::new(CkksPreset::N8192, 20)?;      // A 20-bit plaintext modulus. Up to 50 bits.
 let (secret, public) = bfv.keygen();
 let relin = bfv.relin_keygen(&secret);
 let x = bfv.encrypt(&public, &[1000, -2000, 3])?;
@@ -569,7 +585,23 @@ leaves less room. These are measured, by the `measure_budgets` test, as the bits
 | `N16384` | 30 bits | 283 | 239, 196, 153, 109, 65, 21 | 6 |
 | `N16384` | 40 bits | 261 | 207, 154, 100, 47 | 4 |
 
-`t` has to be a prime that is 1 mod `2N`, and few of those are small: at `N16384`, the largest 20-bit one is 786433.
+`t` has to be a prime that is 1 mod `2N`, and few of those are small: at `N16384`, the largest 20-bit one is 786433. Cohort statistics
+take only additions, so they use a 50-bit `t`, which leaves plenty of room for sums.
+
+**From the command line.** Packing a cohort takes `--scheme bfv`, and `cohort-merge` and `cohort-stats` recognize what they are given:
+
+```bash
+M=./target/release/medcrypto
+$M bfv-encrypt --values 1000,-2000,3 --public-key keys/public-key.json --output ints.json
+$M bfv-decrypt --input ints.json --secret-key keys/secret-key.json     # 1000, -2000, 3
+
+$M ingest-fhir --bundle site-a.json --loinc-filter 8480-6,4548-4 --mode vertical \
+  --scheme bfv --fixed-point 100 --public-key keys/public-key.json --output a.bfv.json
+$M cohort-stats --input a.bfv.json --keys keys
+```
+
+Packing refuses a cohort whose sum of squares could reach `t`, with room left for other sites, since an overflow under encryption
+could not be noticed afterwards.
 
 **Exact scaling.** A BFV multiplication needs `round(t * x / Q)` for an `x` larger than `Q` can hold. The usual RNS methods
 approximate this in floating point. Here it is exact, in word arithmetic only. Each polynomial is lifted from `Q` to an auxiliary
@@ -580,7 +612,8 @@ prime of `B`. It costs more than the approximate methods: a multiplication takes
 **Operations.** `add`, `sub`, `negate`, `add_plain`, `multiply_plain`, `multiply`, `relinearize`, `multiply_relin`, `rotate_rows`,
 `swap_rows`, `sum_all` and `noise_budget_bits`. `sum_all` gives every slot the total of all `N`, using keys from `sum_galois_keygen`.
 
-Use separate keys for BFV and CKKS, even though the key types are the same.
+Both schemes use the same kind of key, so a consortium's collective keys serve both, and keys from any earlier version work for BFV.
+`sum_rows` needs only the rotation keys those already hold, for values in the first row of slots, which is what cohorts use.
 
 ### What the API differs on from the roadmap's sketch
 
@@ -720,12 +753,31 @@ pub trait ZkPredicateProver {
 }
 ```
 
-| Backend | Assumption | Post-quantum | Needs | Use |
-| :--- | :--- | :--- | :--- | :--- |
-| `PedersenBackend` | Discrete logarithm on ristretto255 | No | Nothing | Development and testing inside a hospital |
-| `StarkCoprocessorBackend` | Depends on the prover, typically hash-based | If the runner is | An external runner and guest program | Audit and production |
+| Backend | Assumption | Post-quantum | Size | Needs | Use |
+| :--- | :--- | :--- | ---: | :--- | :--- |
+| `PedersenBackend` | Discrete logarithm on ristretto255 | No | 2.2 KiB | Nothing | Development and testing inside a hospital |
+| `HashBasedBackend` | SHA-256 only | Yes | 1.3 MB | Nothing | Production |
+| `StarkCoprocessorBackend` | Depends on the prover, typically hash-based | If the runner is | Depends on the prover | An external runner and guest program | Where proofs must be small |
 
 `--profile production` refuses `PedersenBackend`, by way of `backend_for_profile`.
+
+### How the hash-based range proof works
+
+[`range_proof.rs`](crates/medcrypto-pq/src/range_proof.rs) uses MPC in the head, in the style of ZKBoo. The commitment is
+`SHA-256("mcrange1" || value || blinding)`, and the statement is that the prover knows a value and blinding with that hash, and that
+`min <= value <= max`.
+
+The prover splits its secret into three random shares that XOR to it, and imagines three parties computing the whole statement
+between them: all 64 rounds of SHA-256, and the two 64-bit comparisons. XOR gates are local. Each AND gate has a party combine its
+own share with the next party's and with random tape, so that any two parties' views together say nothing about the secret, while all
+three are needed to compute it.
+
+The prover commits to all three views, and a hash of everything picks two to open (Fiat-Shamir). If the prover cheated anywhere,
+at least one of the three pairs is inconsistent, so each round catches it with probability at least 1/3. With 438 rounds, the chance
+of getting through is `(2/3)^438`, about `2^-256`. Grover's algorithm square-roots a search for lucky challenges, which leaves about
+128 bits. Tests run a cheating prover through the same protocol, and it fails.
+
+It needs nothing external, and makes no assumption beyond the hash. The price is size, because the proof holds a transcript of the circuit for each round.
 
 ### How the Pedersen range proof works
 
@@ -809,7 +861,9 @@ Messages may arrive in any order. A partial decryption that arrives before its a
 
 ### Trust checks on every message
 
-1. **TLS.** The peer's certificate has to chain to the consortium's CA, on both sides of the connection.
+1. **TLS.** The peer's certificate has to chain to the consortium's CA, on both sides of the connection. Key exchange is hybrid
+   X25519 and ML-KEM-768, so that traffic recorded today stays private from a quantum computer later, and a test confirms
+   this by handshaking with a running daemon while offering nothing else.
 2. **Roster.** The certificate's SHA-256 has to be the one the roster lists for the claimed sender, so even the CA cannot add a
    member without changing every node's roster.
 3. **Signatures.** Both an Ed25519 and an ML-DSA-65 signature have to cover the consortium, sender, recipient and payload hash, so
@@ -821,7 +875,7 @@ The gRPC service is defined in [`proto/consortium.proto`](proto/consortium.proto
 
 ### Hybrid signatures
 
-[`signatures.rs`](src/signatures.rs) signs each message with both Ed25519 and ML-DSA-65 (FIPS 204), and verification needs both.
+[`signatures.rs`](crates/medcrypto-pq/src/signatures.rs) signs each message with both Ed25519 and ML-DSA-65 (FIPS 204), and verification needs both.
 
 - ML-DSA is what holds against a quantum computer, since Ed25519 falls to Shor's algorithm.
 - Ed25519 stays because ML-DSA is young. If a flaw turns up in it, or in this implementation, a forgery still means breaking
@@ -887,6 +941,32 @@ among themselves.
 To give each hospital its part, copy over its own directory, plus `ca.pem`, `roster.json` and `studies.json`. `ca-key.pem`
 goes to none of them. Then edit the paths in `node.json`.
 
+### Keys from older versions
+
+Nothing has to be regenerated. Key shares, collective keys, certificates and identities all carry over, and every format here reads the
+versions before it.
+
+- **0.3.x** rosters work as they are.
+- **0.2.x** rosters list Ed25519 alone. A node on one keeps working, with the same key, signing the way that version did, so that
+  old and new nodes can run side by side during an upgrade. Each node's seed file also yields an ML-DSA key.
+
+To bring a 0.2.x consortium up to hybrid signatures, once all nodes run this version:
+
+```bash
+# At each hospital. The output holds only public keys.
+$M consortium-export-key --config consortium/hospital-a/node.json --output hospital-a.key.json
+
+# Once, with all of them, and then give every node the new roster.
+$M consortium-import-keys --roster consortium/roster.json hospital-a.key.json hospital-b.key.json hospital-c.key.json
+```
+
+An import can only add a key to a node with the same Ed25519 key, so it cannot take over another node's identity. And an entry with an
+ML-DSA key never again accepts Ed25519 alone, so nothing can downgrade it. A test runs a study on an old roster, upgrades it, runs another,
+and checks that the key shares have not changed by a byte.
+
+File formats from 0.2.0 on read as they are. Wasm export names did change with this version, from `@0.2.0` to `@0.4.0`, so hosts that name
+them have to update that string. The keys and ciphertexts themselves are unchanged.
+
 ### Known operational limits
 
 - A restart after key generation restores keys from disk. A restart **during** key generation means starting key generation
@@ -931,7 +1011,10 @@ those who announced the same hash.
 key (the attack of Li and Micciancio). Each party adds noise uniform in `[-2^b, 2^b)`. The default `b = 24`, in the roster's
 `smudging_bits`, leaves about `2^-9` of absolute noise per party in a decoded value, at scale `2^40` and `N = 8192`.
 
-**Be aware of what this is.** The ratio between this noise and the ciphertext's own noise is at most around `2^14`, which is well short
+BFV holds its message in the high bits, far above this noise, so it uses `b = 50` with no effect on the exact result, in
+`BFV_SMUDGING_BITS`.
+
+**Be aware of what this is.** For CKKS, the ratio between this noise and the ciphertext's own noise is at most around `2^14`, which is well short
 of the statistically negligible distance that a security proof by noise flooding asks for. Raising `smudging_bits` helps at a
 direct cost to precision, and the 2^40 scale leaves limited room. Treat the current value as defense in depth, for
 parties following the protocol.
@@ -980,9 +1063,34 @@ interface fhe-ops {
 }
 ```
 
-This runs CKKS at `N = 8192`, and BFV and hybrid signatures are not in the component yet. It differs from the roadmap's sketch in three ways, on purpose: `encrypt-vector` takes `entropy`, because
+This runs CKKS at `N = 8192`. It differs from the roadmap's sketch in three ways, on purpose: `encrypt-vector` takes `entropy`, because
 this component has no random source; functions return `result`, because input can be bad; and `keygen` and `decrypt-vector` are
 added, since nothing could be used otherwise.
+
+### The `bfv-ops` and `pq-signatures` interfaces
+
+```wit
+interface bfv-ops {
+    record bfv-ciphertext { data: list<u8>, degree: u32, plain-modulus: u64 }
+
+    keygen: func(entropy: list<u8>) -> result<fhe-keypair, fhe-error>;
+    relin-keygen: func(sk: list<u8>, entropy: list<u8>) -> result<list<u8>, fhe-error>;
+    encrypt: func(pk: list<u8>, plain-bits: u32, values: list<s64>, entropy: list<u8>) -> result<bfv-ciphertext, fhe-error>;
+    decrypt: func(sk: list<u8>, a: bfv-ciphertext) -> result<list<s64>, fhe-error>;
+    add: func(a: bfv-ciphertext, b: bfv-ciphertext) -> result<bfv-ciphertext, fhe-error>;
+    multiply: func(a: bfv-ciphertext, b: bfv-ciphertext, relin-key: list<u8>) -> result<bfv-ciphertext, fhe-error>;
+    noise-budget: func(sk: list<u8>, a: bfv-ciphertext) -> result<f64, fhe-error>;
+}
+
+interface pq-signatures {
+    record hybrid-public-key { ed25519: list<u8>, ml-dsa65: list<u8> }
+    record hybrid-signature { ed25519: list<u8>, ml-dsa65: list<u8> }
+
+    public-key-from-seed: func(seed: list<u8>) -> result<hybrid-public-key, crypto-error>;
+    sign: func(seed: list<u8>, context: list<u8>, message: list<u8>, entropy: list<u8>) -> result<hybrid-signature, crypto-error>;
+    verify: func(public-key: hybrid-public-key, context: list<u8>, message: list<u8>, signature: hybrid-signature) -> bool;
+}
+```
 
 **It imports nothing.** The component has no file, clock, network or random access, which CI checks on every build, so whatever a
 bug in it could do is limited to computing a wrong answer. Because of that, randomness has to come from the caller. Pass 32 fresh
@@ -999,6 +1107,19 @@ secret = bytes(getattr(pair, "secret-key"))
 a = m.fhe_call("encrypt-vector", public, [120.5, 80.0, 5.75], secrets.token_bytes(32))
 b = m.fhe_call("encrypt-vector", public, [10.0, 20.0, 0.25], secrets.token_bytes(32))
 print(m.fhe_call("decrypt-vector", secret, m.fhe_call("homomorphic-add", a, b)))
+
+# Exact integers
+pair = m.bfv_call("keygen", secrets.token_bytes(32))
+public = bytes(getattr(pair, "public-key"))
+secret = bytes(getattr(pair, "secret-key"))
+a = m.bfv_call("encrypt", public, 20, [1000, -2000, 3], secrets.token_bytes(32))
+print(m.bfv_call("decrypt", secret, m.bfv_call("add", a, a)))   # [2000, -4000, 6]
+
+# A post-quantum signature
+seed = secrets.token_bytes(32)
+public = m.pq_call("public-key-from-seed", seed)
+signature = m.pq_call("sign", seed, b"release", b"count: 1500", secrets.token_bytes(32))
+print(m.pq_call("verify", public, b"release", b"count: 1500", signature))   # True
 ```
 
 ```javascript
@@ -1009,6 +1130,16 @@ const { publicKey, secretKey } = fheOps.keygen(random());
 const a = fheOps.encryptVector(publicKey, Float64Array.of(120.5, 80.0, 5.75), random());
 const doubled = fheOps.homomorphicScalarMul(a, 2.0);
 console.log(fheOps.decryptVector(secretKey, doubled));
+
+// Exact integers, as BigInt
+const keys = bfvOps.keygen(random());
+const x = bfvOps.encrypt(keys.publicKey, 20, BigInt64Array.of(1000n, -2000n, 3n), random());
+console.log(bfvOps.decrypt(keys.secretKey, bfvOps.add(x, x)));
+
+// A post-quantum signature
+const seed = random();
+const signature = pqSignatures.sign(seed, text("release"), text("count: 1500"), random());
+console.log(pqSignatures.verify(pqSignatures.publicKeyFromSeed(seed), text("release"), text("count: 1500"), signature));
 ```
 
 The hosts in `component/hosts/` each run the same file and have to print exactly
@@ -1033,8 +1164,9 @@ run the core module inside the component file, and handles the Canonical ABI by 
 is more work, and it only works this simply because the component has no imports. Those hosts also show how the record's `f64`
 changes the memory layout.
 
-The expected output rounds decrypted values. Ciphertexts are not compared across platforms, because the floating-point library
-may differ in the last bit between native code and Wasm, which changes rounding in the encoder, though not the decrypted answer.
+The expected output rounds CKKS values, whose ciphertexts are not compared across platforms, because the floating-point library may
+differ in the last bit between native code and Wasm, which changes rounding in the encoder, though not the decrypted answer. BFV and the
+signatures have no floating point in them, so their bytes are compared exactly, on every platform.
 
 ---
 
@@ -1150,14 +1282,18 @@ Secret keys and shares wipe their memory when dropped, and print no key material
 | :--- | :--- | :--- |
 | CKKS and BFV at the presets | RLWE, 128 bits by the standard's table | No efficient attack known |
 | Consortium message signatures | ML-DSA-65 and Ed25519, both required | Holds as long as ML-DSA does |
+| TLS key exchange between nodes, and to FHIR and RPC servers | X25519 and ML-KEM-768 together | Holds as long as ML-KEM does. A remote server that does not support it falls back to its best classical option |
+| Hash-based range proofs | SHA-256 | About 128 bits under Grover |
 | SHA-256 chains, AES-256-GCM | Symmetric | About 128 bits under Grover |
-| Pedersen proofs | Discrete logarithm on an elliptic curve | **Broken** |
-| TLS certificates and key exchange | Whatever `rustls` negotiates, with elliptic-curve certificates | **Certificates broken.** Traffic recorded now may be decrypted later |
+| Pedersen proofs, for development only | Discrete logarithm on an elliptic curve | **Broken**. Production refuses them |
+| TLS certificates | ECDSA | **Broken.** This matters for live impersonation only, and the hybrid signature on each message still has to hold |
 | Consent contract | Ethereum's own signatures | **Broken**, for that chain |
 
-So the homomorphic encryption and the message signatures are post-quantum. **TLS and the Pedersen proofs are not.** Ciphertexts recorded from the
-network remain protected by their CKKS layer, though secret shares sent during key generation rely on TLS alone, which matters if an
-attacker records that traffic today and has a quantum computer later.
+So the homomorphic encryption, the message signatures, the key exchange and the production range proofs are post-quantum, and what stays
+elliptic-curve is X.509 certificates, the development proofs and the chain's own signatures. Recording today's traffic does not help a future
+quantum computer: secret shares in key generation are protected by the hybrid key exchange, and ciphertexts by RLWE as well.
+
+ML-KEM and ML-DSA are young, which is why each is paired with a classical algorithm rather than replacing it: breaking one half is not enough.
 
 ---
 
@@ -1227,10 +1363,11 @@ will differ, so run it.
 | Sign | 0.24 | Signature 3373 bytes |
 | Verify | 0.10 | |
 
-| Range proof (Pedersen) | Prove (ms) | Verify (ms) | Size |
+| Range proof | Prove (ms) | Verify (ms) | Size |
 | :--- | ---: | ---: | ---: |
-| `[0, 65]` | 2.04 | 1.91 | 2.2 KiB |
-| 32-bit range | 8.82 | 9.21 | 10 KiB |
+| Pedersen, `[0, 65]` | 2.04 | 1.91 | 2.2 KiB |
+| Pedersen, 32-bit range | 8.82 | 9.21 | 10 KiB |
+| Hash-based, any range | 38 | 45 | 1.3 MB |
 
 The three-node tutorial, with 1500 patients and 3 analytes, finished key generation and the study within tens of seconds on one laptop. In a real deployment, the bandwidth dominates: each participant sends `3 x analytes x batches` ciphertexts to each
 other node, and each node sends its share of the rotation keys during key generation.
@@ -1239,7 +1376,7 @@ other node, and each node sends its share of the rotation keys during key genera
 
 ## 19. Command reference
 
-BFV has no command of its own yet, and it runs in `demo` and from the library. Run any of these with `--help` for all of its options.
+Run any of these with `--help` for all of its options.
 
 | Command | What it does |
 | :--- | :--- |
@@ -1249,6 +1386,7 @@ BFV has no command of its own yet, and it runs in `demo` and from the library. R
 | `keygen` | Writes a secret key, public key, rotation keys and relinearization key |
 | `encrypt` | Encrypts one patient's vitals |
 | `decrypt` | Decrypts a ciphertext file |
+| `bfv-encrypt`, `bfv-decrypt` | Encrypts integers with BFV, and decrypts them exactly, reporting the noise budget |
 | `ingest-fhir` | FHIR server or bundle, to vertical ciphertexts, horizontal envelopes, or a plain table |
 | `batch-pack` | A directory of `PatientRecord` files or bundles, to vertical ciphertexts |
 | `cohort-merge` | Combines several sites' cohorts |
@@ -1261,6 +1399,7 @@ BFV has no command of its own yet, and it runs in `demo` and from the library. R
 | `sign`, `verify-signature` | Signs a file and checks it, with both algorithms |
 | `quantum-audit` | Checks parameters against the HE Standard |
 | `consortium-init` | Creates a CA, certificates, keys, a roster and node configurations |
+| `consortium-export-key`, `consortium-import-keys` | Brings a roster from before 0.3.0 up to hybrid signatures, with no new keys |
 | `daemon run` | Runs a node until interrupted |
 | `daemon status` | Asks a node how it is doing |
 
@@ -1279,6 +1418,9 @@ Options for `ingest-fhir`:
 | `--pseudonym-key` | Next to the output | The site's secret, created if missing |
 | `--key-store` | `medcrypto-keystore.json` | Envelope keys, for horizontal mode |
 | `--allow-insecure-http` | Off | Allow `http://` to a remote host |
+| `--scheme` | `ckks` | `ckks`, or `bfv` for exact results. Also on `batch-pack` |
+| `--fixed-point` | 10 | For BFV: what values are multiplied by, so 10 keeps one decimal |
+| `--plain-bits` | 50 | For BFV: the size of the plaintext modulus |
 
 Exit status is 0 on success and 1 on any error, including a proof that fails to verify, and 126 for a license problem.
 
@@ -1313,6 +1455,8 @@ between minor versions before 1.0.
                "winsorized": 0, "missing": 0, "imputed": 0}]
 }
 ```
+
+A BFV cohort has the same shape, with `"format": "medcrypto-bfv-cohort-v1"`, and adds `plain_bits`, `plain_modulus` and `fixed_point`.
 
 **A table** (`--mode table`, kept at the hospital)
 
@@ -1380,14 +1524,14 @@ meant for demonstrations. The daemon, the FHIR pipeline and threshold decryption
 medcrypto/
 ├── crates/
 │   ├── medcrypto-fhe/        RNS-CKKS, RNS-BFV and threshold decryption. No OS dependency without os-rng
-│   └── medcrypto-fhir/       FHIR parsing, terminology, cleaning, HTTP client
+│   ├── medcrypto-fhir/       FHIR parsing, terminology, cleaning, HTTP client
+│   └── medcrypto-pq/         Hybrid signatures and hash-based range proofs. No OS dependency without os-rng
 ├── src/
 │   ├── main.rs               The command line
 │   ├── packing/              Horizontal envelopes and vertical cohorts
-│   ├── zkp/                  ZkPredicateProver, Pedersen range proofs, the STARK adapter
+│   ├── zkp/                  ZkPredicateProver: Pedersen, hash-based and the STARK adapter
 │   ├── consortium/           Roster, consent sources, protocol state machine, gRPC and TLS
 │   ├── compliance/           Key store, shredding, audit chain
-│   ├── signatures.rs         Hybrid ML-DSA-65 and Ed25519 signatures
 │   ├── quantum/              The check against the HE Standard
 │   ├── blockchain/           DID and consent simulator, EVM calldata
 │   ├── clinical_ai/          The medication recommender sample
@@ -1427,8 +1571,12 @@ The cryptographic crates are built with optimization even in debug mode, so the 
 | FHIR | `crates/medcrypto-fhir/tests` | Parsing, conversion, cleaning, and the client against a real socket, including a hostile `next` link |
 | Packing | `tests/packing_test.rs` | Statistics match plaintext, missing values are excluded, erasure holds across processes |
 | Range proofs | `tests/zkp_range_test.rs` | Honest proofs verify. Tampering and moved commitments fail. Production refuses Pedersen. The runner rules hold |
+| BFV in the daemon | `tests/consortium_test.rs` | A BFV study through real nodes gives identical, exact results on all of them |
 | Daemon | `tests/consortium_test.rs` | Three real nodes over mutual TLS get the right statistics, with consent and cell suppression applied, one node down, and restart from disk. An outside certificate is refused. A study withdrawn midway is not decrypted |
-| Signatures | `src/signatures.rs`, `src/consortium/network.rs` | Key generation matches NIST's vector. Both halves are required. A message with either missing, or replayed elsewhere, is refused |
+| Signatures | `crates/medcrypto-pq`, `src/consortium/network.rs` | Key generation matches NIST's vector. Both halves are required. A message with either missing, or replayed elsewhere, is refused. A hybrid entry cannot be downgraded |
+| Hash-based proofs | `crates/medcrypto-pq` | The circuit computes real SHA-256. A prover cheating through the protocol fails. Tampering anywhere fails |
+| Post-quantum TLS | `tests/consortium_test.rs` | A real handshake with a running daemon, offering only X25519MLKEM768 |
+| Key compatibility | `tests/consortium_test.rs`, `tests/cli_test.rs` | A study on a 0.2-format roster, the upgrade, another study, and unchanged key shares |
 | Consent | `tests/evm_consent_test.rs` | ABI encoding, failing closed, and the contract on a real local chain when Foundry is present |
 | Command line | `tests/cli_test.rs` | The documented commands, through the real binary |
 | Wasm | `component/tests/vectors.rs` | Published vectors, and that the expected host output is right |
@@ -1460,15 +1608,17 @@ Versioning: a fix increments `0.0.X`, and new functionality or platform support 
 | FHIR crate, `ingest-fhir` | Done | Tested with a local mock server, not a production EMR |
 | `ZkPredicateProver`, real Pedersen range proofs | Done | |
 | `StarkCoprocessorBackend` | Adapter done | **Not yet run with a real prover** |
+| Post-quantum range proofs, built in | Done | MPC in the head on SHA-256 |
+| Post-quantum TLS key exchange | Done | X25519MLKEM768 |
 | Daemon over gRPC and mutual TLS | Done | Honest-but-curious model |
 | Consent from a smart contract | Done | Tested on a local chain only |
 | k-of-n key generation and threshold decryption | Done | No verifiable secret sharing |
 | Wasm `fhe-ops` | Done | Python, TypeScript and Go |
-| RNS-BFV | Done | Library and demo. Not yet in the daemon, the command line or Wasm |
+| RNS-BFV | Done | Library, threshold decryption, daemon, command line, GUI and Wasm |
 | Hybrid ML-DSA-65 and Ed25519 signatures | Done | On all daemon messages and for files |
 
 Worth doing next, roughly in order of value: verifiable secret sharing and proofs of correct partial decryption; input range proofs for
-contributions; differential privacy on released statistics; post-quantum TLS; BFV in the daemon; a real SP1 runner; key store integration
+contributions; differential privacy on released statistics; post-quantum certificates; a real SP1 runner; key store integration
 with an HSM or KMS; and resharing for changing membership.
 
 ---
@@ -1502,6 +1652,8 @@ with an HSM or KMS; and resharing for changing membership.
 | BFV | A homomorphic encryption scheme for exact arithmetic on integers modulo `t` |
 | Noise budget | How much more noise a BFV ciphertext can take before it decrypts wrongly |
 | ML-DSA | A lattice-based signature scheme standardized as FIPS 204, formerly Dilithium |
+| ML-KEM | A lattice-based key exchange standardized as FIPS 203, formerly Kyber |
+| MPC in the head | Proving a statement by simulating several parties computing it, and opening some of them |
 | RNS | Residue Number System: storing a big number as its residues modulo several small primes |
 | RLWE | Ring Learning With Errors, the lattice problem CKKS's security rests on |
 | `N` | The polynomial ring's degree. Larger is more secure and slower |

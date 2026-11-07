@@ -2,12 +2,16 @@
 //!
 //! - [`PedersenBackend`]: a real range proof over ristretto255. Fast, needs nothing external, and sound as
 //!   long as discrete logarithms are hard, which a large quantum computer would end.
+//! - [`HashBasedBackend`]: a built-in range proof resting only on SHA-256, which is post-quantum. Slower to
+//!   check and much larger, at about 1.4 MB a proof.
 //! - [`StarkCoprocessorBackend`]: hands the statement to an external hash-based prover. The prover
 //!   has to declare that it is post-quantum and zero-knowledge, or this backend refuses to use it.
 
+pub mod hash_based;
 pub mod pedersen;
 pub mod stark;
 
+pub use hash_based::HashBasedBackend;
 pub use pedersen::{PedersenBackend, RangeProof};
 pub use stark::{ProverCapabilities, StarkCoprocessorBackend};
 
@@ -164,19 +168,28 @@ pub enum Profile {
     Production,
 }
 
+/// Which proof system to use.
+pub enum ProofChoice {
+    Pedersen,
+    /// Hash-based, built in, and needing no external program.
+    HashBased,
+    Stark(StarkCoprocessorBackend),
+}
+
 /// Refuses to give a production deployment a backend that a quantum computer could break.
 pub fn backend_for_profile(
     profile: Profile,
-    stark: Option<StarkCoprocessorBackend>,
+    choice: ProofChoice,
 ) -> Result<Box<dyn ZkPredicateProver>, CryptoError> {
-    match (profile, stark) {
-        (_, Some(backend)) => {
+    match (profile, choice) {
+        (_, ProofChoice::Stark(backend)) => {
             backend.require_capabilities()?;
             Ok(Box::new(backend))
         }
-        (Profile::Development, None) => Ok(Box::new(PedersenBackend)),
-        (Profile::Production, None) => Err(CryptoError::Backend(
-            "the production profile needs a STARK runner: the Pedersen backend is not post-quantum"
+        (_, ProofChoice::HashBased) => Ok(Box::new(HashBasedBackend)),
+        (Profile::Development, ProofChoice::Pedersen) => Ok(Box::new(PedersenBackend)),
+        (Profile::Production, ProofChoice::Pedersen) => Err(CryptoError::Backend(
+            "the production profile refuses the Pedersen backend, which is not post-quantum: use the hash backend"
                 .into(),
         )),
     }

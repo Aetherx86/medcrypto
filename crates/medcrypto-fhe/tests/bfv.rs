@@ -14,7 +14,7 @@ fn centered(value: i128, t: u64) -> i64 {
 #[test]
 fn parameters_are_checked() {
     assert!(BfvEngine::new(CkksPreset::N8192, 19).is_err());
-    assert!(BfvEngine::new(CkksPreset::N8192, 41).is_err());
+    assert!(BfvEngine::new(CkksPreset::N8192, 51).is_err());
     let e = engine();
     assert_eq!(e.slots(), 8192);
     assert_eq!(e.plain_modulus() % (2 * 8192), 1);

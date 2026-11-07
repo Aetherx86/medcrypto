@@ -321,6 +321,222 @@ fn shredding_really_destroys_the_key_across_processes() {
 }
 
 #[test]
+fn bfv_through_the_command_line() {
+    let directory = tempfile::tempdir().unwrap();
+    let cwd = directory.path();
+    std::fs::write(cwd.join("bundle.json"), sample_bundle(20)).unwrap();
+    succeed(cwd, &["keygen", "--output-dir", "keys"]);
+
+    // Plain integers, exactly, with negatives.
+    succeed(
+        cwd,
+        &[
+            "bfv-encrypt",
+            "--values",
+            "1000,-2000,3",
+            "--public-key",
+            "keys/public-key.json",
+            "--output",
+            "ints.json",
+        ],
+    );
+    let out = succeed(
+        cwd,
+        &[
+            "bfv-decrypt",
+            "--input",
+            "ints.json",
+            "--secret-key",
+            "keys/secret-key.json",
+        ],
+    );
+    assert_eq!(out.trim(), "1000, -2000, 3");
+
+    // A cohort from FHIR, merged across two sites, gives the exact statistics.
+    for name in ["a", "b"] {
+        succeed(
+            cwd,
+            &[
+                "ingest-fhir",
+                "--bundle",
+                "bundle.json",
+                "--loinc-filter",
+                "8480-6,4548-4,15074-8",
+                "--mode",
+                "vertical",
+                "--scheme",
+                "bfv",
+                "--fixed-point",
+                "100",
+                "--public-key",
+                "keys/public-key.json",
+                "--output",
+                &format!("{name}.ct.json"),
+            ],
+        );
+    }
+    succeed(
+        cwd,
+        &[
+            "cohort-merge",
+            "a.ct.json",
+            "b.ct.json",
+            "--output",
+            "both.ct.json",
+        ],
+    );
+    let out = succeed(
+        cwd,
+        &["cohort-stats", "--input", "both.ct.json", "--keys", "keys"],
+    );
+    assert!(out.contains("129.500") && out.contains("40"), "{out}");
+
+    // BFV and CKKS cohorts do not mix.
+    succeed(
+        cwd,
+        &[
+            "ingest-fhir",
+            "--bundle",
+            "bundle.json",
+            "--loinc-filter",
+            "8480-6,4548-4,15074-8",
+            "--public-key",
+            "keys/public-key.json",
+            "--output",
+            "c.ct.json",
+        ],
+    );
+    assert!(!medcrypto(
+        cwd,
+        &[
+            "cohort-merge",
+            "a.ct.json",
+            "c.ct.json",
+            "--output",
+            "x.json"
+        ]
+    )
+    .status
+    .success());
+}
+
+#[test]
+fn a_post_quantum_proof_through_the_command_line() {
+    let directory = tempfile::tempdir().unwrap();
+    let cwd = directory.path();
+    let prove = [
+        "prove",
+        "--value",
+        "58",
+        "--threshold",
+        "65",
+        "--backend",
+        "hash",
+        "--profile",
+        "production",
+        "--output",
+        "pq.json",
+    ];
+    succeed(cwd, &prove);
+    let out = succeed(
+        cwd,
+        &[
+            "verify",
+            "--proof-file",
+            "pq.json",
+            "--backend",
+            "hash",
+            "--profile",
+            "production",
+        ],
+    );
+    assert!(out.contains("VERIFIED"));
+    // The classical verifier does not accept it.
+    assert!(!medcrypto(cwd, &["verify", "--proof-file", "pq.json"])
+        .status
+        .success());
+    assert!(!medcrypto(
+        cwd,
+        &[
+            "prove",
+            "--value",
+            "82",
+            "--threshold",
+            "65",
+            "--backend",
+            "hash"
+        ]
+    )
+    .status
+    .success());
+}
+
+#[test]
+fn an_old_roster_upgrades_through_the_command_line() {
+    let directory = tempfile::tempdir().unwrap();
+    let cwd = directory.path();
+    succeed(
+        cwd,
+        &[
+            "consortium-init",
+            "--out",
+            "c",
+            "--threshold",
+            "1",
+            "--nodes",
+            "node-a=https://127.0.0.1:7443,node-b=https://127.0.0.1:7444",
+        ],
+    );
+    let path = cwd.join("c/roster.json");
+    let mut roster: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for node in roster["nodes"].as_array_mut().unwrap() {
+        let id = node["id"].as_str().unwrap().to_string();
+        let seed = [if id == "node-a" { 21u8 } else { 22 }; 32];
+        std::fs::write(
+            cwd.join("c").join(&id).join("signing.key"),
+            hex::encode(seed),
+        )
+        .unwrap();
+        let old = medcrypto::signatures::HybridSigningKey::from_legacy_ed25519_seed(&seed);
+        node["signing_public_key"] = hex::encode(&old.public_key().ed25519).into();
+    }
+    std::fs::write(&path, roster.to_string()).unwrap();
+    for id in ["node-a", "node-b"] {
+        succeed(
+            cwd,
+            &[
+                "consortium-export-key",
+                "--config",
+                &format!("c/{id}/node.json"),
+                "--output",
+                &format!("{id}.key.json"),
+            ],
+        );
+    }
+    let out = succeed(
+        cwd,
+        &[
+            "consortium-import-keys",
+            "--roster",
+            "c/roster.json",
+            "node-a.key.json",
+            "node-b.key.json",
+        ],
+    );
+    assert!(out.contains("2 node(s)"), "{out}");
+    let upgraded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(
+        upgraded["nodes"][0]["signing_public_key"]["ml_dsa_65"]
+            .as_str()
+            .unwrap()
+            .len()
+            > 3000
+    );
+}
+
+#[test]
 fn hybrid_signatures_through_the_command_line() {
     let directory = tempfile::tempdir().unwrap();
     let cwd = directory.path();

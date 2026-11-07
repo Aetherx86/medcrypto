@@ -1,3 +1,5 @@
 /target
 /component/dist/
 __pycache__/
+# Commercial contract templates stay out of the repository.
+/commercial/

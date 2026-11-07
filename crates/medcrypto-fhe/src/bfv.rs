@@ -195,12 +195,12 @@ fn half_of_product(primes: &[u64], targets: &[Modulus]) -> Vec<u64> {
 }
 
 impl BfvEngine {
-    /// `plain_bits` is the size of `t`, from 20 to 40 bits. Larger values wrap around later, and leave less
-    /// noise budget for multiplications.
+    /// `plain_bits` is the size of `t`, from 20 to 50 bits. Larger values wrap around later, and leave less
+    /// noise budget for multiplications. For additions alone, as in cohort statistics, 50 bits is fine.
     pub fn new(preset: CkksPreset, plain_bits: u32) -> Result<Self, FheError> {
-        if !(20..=40).contains(&plain_bits) {
+        if !(20..=50).contains(&plain_bits) {
             return Err(FheError::InvalidParameters(format!(
-                "plain_bits {plain_bits}: use 20 to 40"
+                "plain_bits {plain_bits}: use 20 to 50"
             )));
         }
         let ckks = CKKSEngine::from_preset(preset);
@@ -544,10 +544,33 @@ impl BfvEngine {
     /// The slot values, as integers in the plaintext range. Works on degree-2 ciphertexts as well.
     pub fn decrypt(&self, sk: &SecretKey, ct: &BfvCiphertext) -> Result<Vec<i64>, FheError> {
         let phase = self.phase(sk, ct)?;
-        let aux = self.q_to_aux.lift(&phase, true);
-        let scaled = self.scale_down(&phase, &aux);
+        Ok(self.decode_phase(&phase, ct.num_slots))
+    }
+
+    /// From `Delta * m + noise` in the coefficient domain, to the slot values.
+    fn decode_phase(&self, phase: &[Vec<u64>], num_slots: usize) -> Vec<i64> {
+        let aux = self.q_to_aux.lift(phase, true);
+        let scaled = self.scale_down(phase, &aux);
         let mut plain = self.aux_to_t.lift(&scaled, true);
-        Ok(self.decode(plain.remove(0), ct.num_slots))
+        self.decode(plain.remove(0), num_slots)
+    }
+
+    /// The same, from the NTT domain, for threshold decryption.
+    pub(crate) fn decode_phase_ntt(&self, mut sum: RnsPoly, num_slots: usize) -> Vec<i64> {
+        for (i, limb) in sum.limbs.iter_mut().enumerate() {
+            self.ckks.context().tables[i].inverse(limb);
+        }
+        self.decode_phase(&sum.limbs, num_slots)
+    }
+
+    /// The underlying engine, which holds the ring and the primes.
+    pub fn ckks(&self) -> &CKKSEngine {
+        &self.ckks
+    }
+
+    /// The size of `t` in bits.
+    pub fn plain_bits(&self) -> u32 {
+        64 - self.t.modulus.q.leading_zeros()
     }
 
     /// How many bits of noise room remain. Below 1, decryption gives wrong answers, since noise that has
@@ -849,6 +872,23 @@ impl BfvEngine {
             galois_key,
             FheError::MissingGaloisKey { steps: 0 },
         )
+    }
+
+    /// Each slot of a row becomes that row's total, modulo `t`. It needs only the rotation keys that CKKS's
+    /// `sum_slots` uses, which is what a consortium's collective keys hold, so it works on values that all
+    /// fit in the first row. Decrypting the result reveals only the total.
+    pub fn sum_rows(
+        &self,
+        ct: &BfvCiphertext,
+        galois_key: &GaloisKey,
+    ) -> Result<BfvCiphertext, FheError> {
+        let mut sum = ct.clone();
+        for step in self.ckks.sum_rotation_steps() {
+            let rotated = self.rotate_rows(&sum, step, galois_key)?;
+            sum = self.add(&sum, &rotated)?;
+        }
+        sum.num_slots = 1;
+        Ok(sum)
     }
 
     /// Every slot becomes the sum of all `N` slots, modulo `t`. Keys come from

@@ -3,6 +3,38 @@
 Versions follow this rule: a bug or security fix increments `0.0.X`, and new functionality or new platform
 support increments `0.X.0`.
 
+## 0.4.0
+
+BFV everywhere, post-quantum where it was missing, and keys from older versions carried over. English first, then Korean.
+
+| Area | Before (0.3.0) | After (0.4.0) |
+| :--- | :--- | :--- |
+| BFV reach | Library and demo | Also threshold decryption, the daemon (`scheme` in a study), the command line, the GUI and Wasm |
+| TLS key exchange | Classical (ring) | Hybrid X25519 and ML-KEM-768 (aws-lc-rs), between nodes and to FHIR and RPC servers |
+| Production range proofs | Refused unless an external prover was installed | Built in: `--backend hash`, MPC in the head on SHA-256, about 128 post-quantum bits |
+| Wasm interfaces | `api`, `fhe-ops` | Also `bfv-ops` and `pq-signatures` |
+| Wasm package version | `@0.2.0` | `@0.4.0`, so hosts naming exports have to update that string |
+| Rosters from 0.2.x | Had to be created again | Work as they are, and upgrade with `consortium-export-key` and `consortium-import-keys`, keeping key shares and identities |
+| `plain_bits` for BFV | 20 to 40 | 20 to 50 |
+| Hybrid signature code | In the main crate | In `crates/medcrypto-pq`, so that Wasm can use it |
+| New build requirement | None | A C compiler, for the TLS library |
+
+X.509 certificates, the development-only Pedersen backend and a chain's own signatures remain elliptic-curve.
+
+| 영역 | 이전 (0.3.0) | 이후 (0.4.0) |
+| :--- | :--- | :--- |
+| BFV 적용 범위 | 라이브러리와 데모 | 임계 복호화, 데몬(연구의 `scheme`), 명령줄, GUI, Wasm까지 |
+| TLS 키 교환 | 고전 방식(ring) | X25519와 ML-KEM-768 하이브리드(aws-lc-rs). 노드 간, FHIR와 RPC 서버 연결 모두 |
+| 프로덕션 범위 증명 | 외부 prover가 없으면 거부 | 내장 `--backend hash`. SHA-256 위의 MPC-in-the-head, 양자 내성 약 128비트 |
+| Wasm 인터페이스 | `api`, `fhe-ops` | `bfv-ops`, `pq-signatures` 추가 |
+| Wasm 패키지 버전 | `@0.2.0` | `@0.4.0`. export 이름을 직접 쓰는 호스트는 문자열 수정 필요 |
+| 0.2.x 로스터 | 다시 만들어야 함 | 그대로 동작하며, `consortium-export-key`, `consortium-import-keys`로 키 조각과 신원을 유지한 채 업그레이드 |
+| BFV `plain_bits` | 20~40 | 20~50 |
+| 하이브리드 서명 코드 | 메인 크레이트 | Wasm에서 쓰도록 `crates/medcrypto-pq`로 이동 |
+| 새 빌드 요구 사항 | 없음 | TLS 라이브러리용 C 컴파일러 |
+
+X.509 인증서, 개발 전용 Pedersen 백엔드, 체인 자체의 서명은 타원곡선으로 남아 있습니다.
+
 ## 0.3.0
 
 Adds a second homomorphic scheme and post-quantum signatures. English first, then Korean.
@@ -18,8 +50,7 @@ Adds a second homomorphic scheme and post-quantum signatures. English first, the
 | Packages | Release files only | Also a container image, `ghcr.io/aetherx86/medcrypto` |
 | License | CC BY-ND 4.0 | CC BY-NC-ND 4.0 |
 
-BFV is in the library and the demo, and is not yet in the daemon, the command line or the Wasm Component. TLS and the Pedersen
-backend are still not post-quantum. `noise_budget_bits` reports how much room a BFV ciphertext has left, and answers go wrong below
+`noise_budget_bits` reports how much room a BFV ciphertext has left, and answers go wrong below
 1 bit.
 
 | 영역 | 이전 (0.2.2) | 이후 (0.3.0) |
@@ -33,7 +64,6 @@ backend are still not post-quantum. `noise_budget_bits` reports how much room a 
 | 패키지 | 릴리스 파일만 | 컨테이너 이미지 `ghcr.io/aetherx86/medcrypto` 추가 |
 | 라이선스 | CC BY-ND 4.0 | CC BY-NC-ND 4.0 |
 
-BFV는 라이브러리와 데모에 있고, 데몬, 명령줄, Wasm Component에는 아직 없습니다. TLS와 Pedersen 백엔드는 여전히 양자 내성이 아닙니다.
 `noise_budget_bits`로 BFV 암호문의 남은 여유를 볼 수 있으며, 1비트 미만이면 답이 틀립니다.
 
 ## 0.2.2

@@ -5,9 +5,10 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use ed25519_compact::{KeyPair, PublicKey, SecretKey, Seed, Signature};
 use hkdf::Hkdf;
 use medcrypto_fhe::{
-    from_bytes, to_bytes, CKKSEngine, Ciphertext, CkksPreset, FheError, PublicKey as FhePublicKey,
-    SecretKey as FheSecretKey,
+    from_bytes, to_bytes, BfvCiphertext, BfvEngine, CKKSEngine, Ciphertext, CkksPreset, FheError,
+    PublicKey as FhePublicKey, RelinKey, SecretKey as FheSecretKey,
 };
+use medcrypto_pq::signatures::{HybridPublicKey, HybridSignature, HybridSigningKey};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use sha2::{Digest, Sha256};
@@ -279,4 +280,165 @@ pub fn fhe_add(a: &FheCiphertext, b: &FheCiphertext) -> Result<FheCiphertext, Fh
 pub fn fhe_scalar_mul(a: &FheCiphertext, scalar: f64) -> Result<FheCiphertext, FheOpError> {
     let (engine, x) = parse_ciphertext(a)?;
     package_ciphertext(&engine.scalar_mul(&x, scalar)?)
+}
+
+/// A BFV ciphertext as the interface passes it around, with `data` being what counts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BfvWire {
+    pub data: Vec<u8>,
+    pub degree: u32,
+    pub plain_modulus: u64,
+}
+
+fn bfv_engine(param_id: u64, plain_bits: u32) -> Result<BfvEngine, FheOpError> {
+    let preset = [CkksPreset::N8192, CkksPreset::N16384]
+        .into_iter()
+        .find(|p| CKKSEngine::from_preset(*p).context().param_id() == param_id)
+        .ok_or(FheOpError::ParameterMismatch)?;
+    BfvEngine::new(preset, plain_bits).map_err(|_| FheOpError::ValueOutOfRange)
+}
+
+fn parse_bfv(input: &BfvWire) -> Result<(BfvEngine, BfvCiphertext), FheOpError> {
+    let ct: BfvCiphertext = from_bytes(&input.data).map_err(|_| FheOpError::BadEncoding)?;
+    if ct.plain_modulus != input.plain_modulus
+        || ct.polys.is_empty()
+        || ct.degree() as u32 != input.degree
+    {
+        return Err(FheOpError::BadEncoding);
+    }
+    let engine = bfv_engine(ct.param_id, 64 - ct.plain_modulus.leading_zeros())
+        .map_err(|_| FheOpError::BadEncoding)?;
+    engine
+        .validate_ciphertext(&ct)
+        .map_err(|_| FheOpError::BadEncoding)?;
+    Ok((engine, ct))
+}
+
+fn package_bfv(ct: &BfvCiphertext) -> Result<BfvWire, FheOpError> {
+    Ok(BfvWire {
+        data: to_bytes(ct).map_err(|_| FheOpError::BadEncoding)?,
+        degree: ct.degree() as u32,
+        plain_modulus: ct.plain_modulus,
+    })
+}
+
+/// Returns the public key and the secret key, at N = 8192.
+pub fn bfv_keygen(entropy: &[u8]) -> Result<(Vec<u8>, Vec<u8>), FheOpError> {
+    let mut rng = entropy_rng(entropy, b"bfv-keygen")?;
+    let (secret, public) = CKKSEngine::from_preset(CkksPreset::N8192).keygen_with(&mut rng);
+    Ok((
+        to_bytes(&public).map_err(|_| FheOpError::BadEncoding)?,
+        to_bytes(&secret).map_err(|_| FheOpError::BadEncoding)?,
+    ))
+}
+
+fn parse_secret(secret_key: &[u8]) -> Result<FheSecretKey, FheOpError> {
+    from_bytes(secret_key).map_err(|_| FheOpError::BadEncoding)
+}
+
+pub fn bfv_relin_keygen(secret_key: &[u8], entropy: &[u8]) -> Result<Vec<u8>, FheOpError> {
+    let mut rng = entropy_rng(entropy, b"bfv-relin")?;
+    let secret = parse_secret(secret_key)?;
+    let engine = engine_for(secret.param_id)?;
+    engine
+        .validate_secret_key(&secret)
+        .map_err(|_| FheOpError::BadEncoding)?;
+    to_bytes(&engine.relin_keygen_with(&secret, &mut rng)).map_err(|_| FheOpError::BadEncoding)
+}
+
+pub fn bfv_encrypt(
+    public_key: &[u8],
+    plain_bits: u32,
+    values: &[i64],
+    entropy: &[u8],
+) -> Result<BfvWire, FheOpError> {
+    let mut rng = entropy_rng(entropy, b"bfv-encrypt")?;
+    let public: FhePublicKey = from_bytes(public_key).map_err(|_| FheOpError::BadEncoding)?;
+    let engine = bfv_engine(public.param_id, plain_bits)?;
+    package_bfv(&engine.encrypt_with(&public, values, &mut rng)?)
+}
+
+pub fn bfv_decrypt(secret_key: &[u8], ciphertext: &BfvWire) -> Result<Vec<i64>, FheOpError> {
+    let secret = parse_secret(secret_key)?;
+    let (engine, ct) = parse_bfv(ciphertext)?;
+    Ok(engine.decrypt(&secret, &ct)?)
+}
+
+pub fn bfv_add(a: &BfvWire, b: &BfvWire) -> Result<BfvWire, FheOpError> {
+    let (engine, x) = parse_bfv(a)?;
+    let (_, y) = parse_bfv(b)?;
+    if x.param_id != y.param_id || x.plain_modulus != y.plain_modulus {
+        return Err(FheOpError::ParameterMismatch);
+    }
+    package_bfv(&engine.add(&x, &y)?)
+}
+
+pub fn bfv_multiply(a: &BfvWire, b: &BfvWire, relin_key: &[u8]) -> Result<BfvWire, FheOpError> {
+    let (engine, x) = parse_bfv(a)?;
+    let (_, y) = parse_bfv(b)?;
+    if x.param_id != y.param_id || x.plain_modulus != y.plain_modulus {
+        return Err(FheOpError::ParameterMismatch);
+    }
+    let key: RelinKey = from_bytes(relin_key).map_err(|_| FheOpError::BadEncoding)?;
+    engine
+        .ckks()
+        .validate_relin_key(&key)
+        .map_err(|_| FheOpError::BadEncoding)?;
+    package_bfv(&engine.multiply_relin(&x, &y, &key)?)
+}
+
+pub fn bfv_noise_budget(secret_key: &[u8], ciphertext: &BfvWire) -> Result<f64, FheOpError> {
+    let secret = parse_secret(secret_key)?;
+    let (engine, ct) = parse_bfv(ciphertext)?;
+    Ok(engine.noise_budget_bits(&secret, &ct)?)
+}
+
+fn seed_of(seed: &[u8]) -> Result<[u8; 32], Error> {
+    let seed: [u8; 32] = seed.try_into().map_err(|_| Error::BadLength)?;
+    // All zeros is what a broken random source tends to produce.
+    if seed == [0; 32] {
+        return Err(Error::WeakSeed);
+    }
+    Ok(seed)
+}
+
+/// Both public keys, as Ed25519 then ML-DSA-65.
+pub fn hybrid_public_key(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let key = HybridSigningKey::from_seed(&seed_of(seed)?);
+    let public = key.public_key();
+    Ok((public.ed25519.clone(), public.ml_dsa_65.clone()))
+}
+
+/// Both signatures, as Ed25519 then ML-DSA-65.
+pub fn hybrid_sign(
+    seed: &[u8],
+    context: &[u8],
+    message: &[u8],
+    entropy: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let entropy: [u8; 32] = entropy.try_into().map_err(|_| Error::BadLength)?;
+    let signature = HybridSigningKey::from_seed(&seed_of(seed)?)
+        .sign_with_entropy(context, message, &entropy)
+        .map_err(|_| Error::BadLength)?;
+    Ok((signature.ed25519, signature.ml_dsa_65))
+}
+
+pub fn hybrid_verify(
+    public: (&[u8], &[u8]),
+    context: &[u8],
+    message: &[u8],
+    signature: (&[u8], &[u8]),
+) -> bool {
+    medcrypto_pq::signatures::verify(
+        &HybridPublicKey {
+            ed25519: public.0.to_vec(),
+            ml_dsa_65: public.1.to_vec(),
+        },
+        context,
+        message,
+        &HybridSignature {
+            ed25519: signature.0.to_vec(),
+            ml_dsa_65: signature.1.to_vec(),
+        },
+    )
 }

@@ -19,8 +19,10 @@ import (
 )
 
 const (
-	prefix    = "medcrypto:crypto/api@0.2.0#"
-	fhePrefix = "medcrypto:crypto/fhe-ops@0.2.0#"
+	prefix    = "medcrypto:crypto/api@0.4.0#"
+	fhePrefix = "medcrypto:crypto/fhe-ops@0.4.0#"
+	bfvPrefix = "medcrypto:crypto/bfv-ops@0.4.0#"
+	pqPrefix  = "medcrypto:crypto/pq-signatures@0.4.0#"
 )
 
 var errorNames = []string{"bad-length", "authentication-failed", "bad-output-length", "weak-seed"}
@@ -182,6 +184,54 @@ func filled(value byte) []byte {
 	return out
 }
 
+// A BFV ciphertext has 8-byte alignment too, for its u64, with the same layout otherwise.
+type bfvCiphertext struct {
+	data    []byte
+	degree  uint32
+	modulus uint64
+}
+
+func (h *host) bfvResult(ret uint64) (bfvCiphertext, string) {
+	tag, _ := h.mod.Memory().ReadByte(uint32(ret))
+	if tag != 0 {
+		code, _ := h.mod.Memory().ReadByte(uint32(ret + 8))
+		return bfvCiphertext{}, fheErrorNames[code]
+	}
+	modulus, ok := h.mod.Memory().ReadUint64Le(uint32(ret + 24))
+	if !ok {
+		panic("read out of range")
+	}
+	return bfvCiphertext{h.bytesAt(ret + 8), h.u32(ret + 16), modulus}, ""
+}
+
+func (h *host) flattenBfv(c bfvCiphertext) []uint64 {
+	p, n := h.list(c.data)
+	return []uint64{p, n, uint64(c.degree), c.modulus}
+}
+
+func (h *host) signedIntegers(values []int64) (uint64, uint64) {
+	p := h.alloc(uint64(len(values))*8, 8)
+	for i, v := range values {
+		h.mod.Memory().WriteUint64Le(uint32(p)+uint32(i)*8, uint64(v))
+	}
+	return p, uint64(len(values))
+}
+
+func (h *host) bfvDecrypted(secret []byte, c bfvCiphertext) string {
+	p, n := h.list(secret)
+	ret := h.callExport(bfvPrefix+"decrypt", append([]uint64{p, n}, h.flattenBfv(c)...)...)
+	if tag, _ := h.mod.Memory().ReadByte(uint32(ret)); tag != 0 {
+		panic("decryption failed")
+	}
+	at, count := h.u32(ret+4), h.u32(ret+8)
+	parts := make([]string, count)
+	for i := range parts {
+		v, _ := h.mod.Memory().ReadUint64Le(at + uint32(i)*8)
+		parts[i] = fmt.Sprintf("%d", int64(v))
+	}
+	return strings.Join(parts, " ")
+}
+
 func decode(s string) []byte {
 	b, err := hex.DecodeString(s)
 	if err != nil {
@@ -340,4 +390,82 @@ func main() {
 	garbage.data = []byte{1, 2, 3}
 	_, e = scalar(garbage, 2.0)
 	fmt.Println("fhe-garbage", e)
+
+	sha := func(data []byte) string {
+		sp, sn := h.list(data)
+		return hexOf("sha256", sp, sn)
+	}
+	p, n = h.list(filled(4))
+	ret = h.callExport(bfvPrefix+"keygen", p, n)
+	if tag, _ := mod.Memory().ReadByte(uint32(ret)); tag != 0 {
+		panic("keygen failed")
+	}
+	bfvPublic, bfvSecret := h.bytesAt(ret+4), h.bytesAt(ret+12)
+	fmt.Println("bfv-public-key", sha(bfvPublic))
+	relin := mustOk(func() ([]byte, string) {
+		r := h.callExport(bfvPrefix+"relin-keygen", two(bfvSecret, filled(5))...)
+		if tag, _ := mod.Memory().ReadByte(uint32(r)); tag != 0 {
+			return nil, "relin-keygen failed"
+		}
+		return h.bytesAt(r + 4), ""
+	}())
+	bfvEncrypt := func(values []int64, entropy byte) bfvCiphertext {
+		kp, kn := h.list(bfvPublic)
+		vp, vn := h.signedIntegers(values)
+		ep, en := h.list(filled(entropy))
+		c, e := h.bfvResult(h.callExport(bfvPrefix+"encrypt", kp, kn, 20, vp, vn, ep, en))
+		if e != "" {
+			panic(e)
+		}
+		return c
+	}
+	x := bfvEncrypt([]int64{1000, -2000, 3}, 6)
+	y := bfvEncrypt([]int64{5, 60, -7}, 7)
+	fmt.Println("bfv-ciphertext", sha(x.data))
+	fmt.Println("bfv-decrypt", h.bfvDecrypted(bfvSecret, x))
+	added, e := h.bfvResult(h.callExport(bfvPrefix+"add", append(h.flattenBfv(x), h.flattenBfv(y)...)...))
+	if e != "" {
+		panic(e)
+	}
+	fmt.Println("bfv-add", h.bfvDecrypted(bfvSecret, added))
+	rp, rn := h.list(relin)
+	product, e := h.bfvResult(h.callExport(bfvPrefix+"multiply", append(append(h.flattenBfv(x), h.flattenBfv(y)...), rp, rn)...))
+	if e != "" {
+		panic(e)
+	}
+	fmt.Println("bfv-multiply", h.bfvDecrypted(bfvSecret, product))
+	p, n = h.list(bfvSecret)
+	ret = h.callExport(bfvPrefix+"noise-budget", append([]uint64{p, n}, h.flattenBfv(product)...)...)
+	budget, _ := mod.Memory().ReadFloat64Le(uint32(ret + 8))
+	fmt.Println("bfv-budget-left", boolean(map[bool]uint64{true: 1, false: 0}[budget > 1.0]))
+	p, n = h.list(make([]byte, 32))
+	ret = h.callExport(bfvPrefix+"keygen", p, n)
+	code, _ = mod.Memory().ReadByte(uint32(ret + 4))
+	fmt.Println("bfv-bad-entropy", fheErrorNames[code])
+
+	seed := filled(8)
+	p, n = h.list(seed)
+	ret = h.callExport(pqPrefix+"public-key-from-seed", p, n)
+	if tag, _ := mod.Memory().ReadByte(uint32(ret)); tag != 0 {
+		panic("public key failed")
+	}
+	pubEd, pubMl := h.bytesAt(ret+4), h.bytesAt(ret+12)
+	fmt.Println("pq-public-key", sha(pubEd), sha(pubMl))
+	ret = h.callExport(pqPrefix+"sign", append(two(seed, []byte("ctx")), two([]byte("message"), filled(9))...)...)
+	if tag, _ := mod.Memory().ReadByte(uint32(ret)); tag != 0 {
+		panic("sign failed")
+	}
+	sigEd, sigMl := h.bytesAt(ret+4), h.bytesAt(ret+12)
+	fmt.Println("pq-signature", sha(sigEd), sha(sigMl))
+	pqVerify := func(message, ml []byte) uint64 {
+		args := append(two(pubEd, pubMl), two([]byte("ctx"), message)...)
+		return h.callExport(pqPrefix+"verify", append(args, two(sigEd, ml)...)...)
+	}
+	fmt.Println("pq-verify", boolean(pqVerify([]byte("message"), sigMl)))
+	fmt.Println("pq-verify-wrong-message", boolean(pqVerify([]byte("other"), sigMl)))
+	fmt.Println("pq-verify-stripped", boolean(pqVerify([]byte("message"), nil)))
+	p, n = h.list(make([]byte, 32))
+	ret = h.callExport(pqPrefix+"public-key-from-seed", p, n)
+	code, _ = mod.Memory().ReadByte(uint32(ret + 4))
+	fmt.Println("pq-weak-seed", errorNames[code])
 }

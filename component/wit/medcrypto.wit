@@ -1,4 +1,4 @@
-package medcrypto:crypto@0.2.0;
+package medcrypto:crypto@0.4.0;
 
 /// Cryptography with no ambient authority. This component imports nothing, so it cannot read a clock, a
 /// file, a socket or a random source. Anything that needs randomness takes it from the caller.
@@ -99,7 +99,69 @@ interface fhe-ops {
     homomorphic-scalar-mul: func(a: ciphertext, scalar: f64) -> result<ciphertext, fhe-error>;
 }
 
+/// RNS-BFV: exact arithmetic on integers, modulo a plaintext modulus. It shares its ring and primes with fhe-ops,
+/// and its keys are the same kind, from `keygen` here. Results wrap around modulo that modulus, and nothing can
+/// detect that under encryption, so choose `plain-bits` large enough for any result.
+interface bfv-ops {
+    use fhe-ops.{fhe-error, fhe-keypair};
+
+    record bfv-ciphertext {
+        data: list<u8>,
+        /// 1 for a normal ciphertext.
+        degree: u32,
+        plain-modulus: u64,
+    }
+
+    /// A key pair at N = 8192, from 32 bytes from a cryptographic random source.
+    keygen: func(entropy: list<u8>) -> result<fhe-keypair, fhe-error>;
+
+    /// The key that multiplication needs, from a secret key and 32 fresh bytes.
+    relin-keygen: func(sk: list<u8>, entropy: list<u8>) -> result<list<u8>, fhe-error>;
+
+    /// Encrypts up to 8192 integers. `plain-bits` is the size of the plaintext modulus, from 20 to 50. A larger one
+    /// leaves less room for multiplications: at 20 bits, three work.
+    encrypt: func(pk: list<u8>, plain-bits: u32, values: list<s64>, entropy: list<u8>) -> result<bfv-ciphertext, fhe-error>;
+
+    /// The exact integers back.
+    decrypt: func(sk: list<u8>, a: bfv-ciphertext) -> result<list<s64>, fhe-error>;
+
+    /// Slot by slot, modulo the plaintext modulus.
+    add: func(a: bfv-ciphertext, b: bfv-ciphertext) -> result<bfv-ciphertext, fhe-error>;
+
+    /// Slot by slot, modulo the plaintext modulus, and brought back to degree 1 with the key.
+    multiply: func(a: bfv-ciphertext, b: bfv-ciphertext, relin-key: list<u8>) -> result<bfv-ciphertext, fhe-error>;
+
+    /// Bits of noise room left. Below 1, decryption gives wrong answers.
+    noise-budget: func(sk: list<u8>, a: bfv-ciphertext) -> result<f64, fhe-error>;
+}
+
+/// Post-quantum signatures: ML-DSA-65 (FIPS 204) and Ed25519 together. Forging one means breaking both.
+interface pq-signatures {
+    use api.{crypto-error};
+
+    record hybrid-public-key {
+        ed25519: list<u8>,
+        ml-dsa65: list<u8>,
+    }
+
+    record hybrid-signature {
+        ed25519: list<u8>,
+        ml-dsa65: list<u8>,
+    }
+
+    /// Both public keys, from a 32-byte seed that is all the secret there is to store.
+    public-key-from-seed: func(seed: list<u8>) -> result<hybrid-public-key, crypto-error>;
+
+    /// Signs. The context says what the signature is for, and `entropy` is 32 fresh bytes that hedge ML-DSA.
+    sign: func(seed: list<u8>, context: list<u8>, message: list<u8>, entropy: list<u8>) -> result<hybrid-signature, crypto-error>;
+
+    /// Whether both signatures hold. Anything malformed is simply not valid.
+    verify: func(public-key: hybrid-public-key, context: list<u8>, message: list<u8>, signature: hybrid-signature) -> bool;
+}
+
 world medcrypto {
     export api;
     export fhe-ops;
+    export bfv-ops;
+    export pq-signatures;
 }

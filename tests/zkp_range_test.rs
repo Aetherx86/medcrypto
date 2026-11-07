@@ -1,6 +1,6 @@
 use medcrypto::zkp::{
-    backend_for_profile, CryptoError, PedersenBackend, Profile, StarkCoprocessorBackend,
-    ThresholdProof, ZKPEngine, ZkPredicateProver, ZkProof,
+    backend_for_profile, CryptoError, PedersenBackend, Profile, ProofChoice,
+    StarkCoprocessorBackend, ThresholdProof, ZKPEngine, ZkPredicateProver, ZkProof,
 };
 
 #[test]
@@ -106,11 +106,31 @@ fn threshold_statements_in_both_directions() {
 }
 
 #[test]
-fn production_refuses_the_quantum_vulnerable_backend() {
-    assert!(backend_for_profile(Profile::Development, None).is_ok());
+fn production_refuses_the_quantum_vulnerable_backend_and_takes_the_hash_based_one() {
+    assert!(backend_for_profile(Profile::Development, ProofChoice::Pedersen).is_ok());
     assert!(matches!(
-        backend_for_profile(Profile::Production, None),
+        backend_for_profile(Profile::Production, ProofChoice::Pedersen),
         Err(CryptoError::Backend(_))
+    ));
+    let backend = backend_for_profile(Profile::Production, ProofChoice::HashBased).unwrap();
+    let proof = backend.prove_range(58, 0, 65).unwrap();
+    assert!(backend.verify_range(&proof, 0, 65));
+    assert!(!backend.verify_range(&proof, 0, 64));
+    assert_eq!(
+        backend.prove_range(66, 0, 65),
+        Err(CryptoError::PredicateUnsatisfied)
+    );
+
+    // Proofs from one system are not accepted by another.
+    assert!(!PedersenBackend.verify_range(&proof, 0, 65));
+    let classical = PedersenBackend.prove_range(58, 0, 65).unwrap();
+    assert!(!backend.verify_range(&classical, 0, 65));
+
+    // The hash-based threshold statement, as the command line makes it.
+    let threshold = ZKPEngine::prove_threshold_with(backend.as_ref(), 58, 65, true).unwrap();
+    assert!(ZKPEngine::verify_threshold_with(
+        backend.as_ref(),
+        &threshold
     ));
 }
 
@@ -195,7 +215,7 @@ esac
         let other = guest(dir.path(), "other.elf", b"a different program");
         assert!(!StarkCoprocessorBackend::new(&other, &runner).verify_range(&proof, 0, 65));
 
-        assert!(backend_for_profile(Profile::Production, Some(backend)).is_ok());
+        assert!(backend_for_profile(Profile::Production, ProofChoice::Stark(backend)).is_ok());
     }
 
     #[test]
@@ -211,7 +231,7 @@ esac
             assert!(
                 matches!(backend.prove_range(1, 0, 2), Err(CryptoError::Backend(m)) if m.contains(expected))
             );
-            assert!(backend_for_profile(Profile::Production, Some(backend)).is_err());
+            assert!(backend_for_profile(Profile::Production, ProofChoice::Stark(backend)).is_err());
         }
     }
 }

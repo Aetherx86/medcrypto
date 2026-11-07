@@ -26,8 +26,9 @@
                  환자 수 1500, 평균 HbA1c 7.106 %, 표준편차 1.370
 ```
 
-Rust로 작성했으며, Python, TypeScript, Go에서 쓸 수 있는 WebAssembly Component를 하나 제공합니다. 동형암호는 근사 실수용 CKKS와 정확한 정수용 BFV
-두 가지를 지원하고, 노드가 보내는 메시지에는 ML-DSA-65와 Ed25519로 함께 서명합니다.
+Rust로 작성했으며, Python, TypeScript, Go에서 쓸 수 있는 WebAssembly Component를 하나 제공합니다. 동형암호는 근사 실수용 CKKS와 정확한 정수용 BFV 두 가지를
+라이브러리, 명령줄, 데몬, Wasm에서 모두 지원합니다. 양자 컴퓨터 대응으로는 ML-DSA-65를 Ed25519와 함께 서명에 쓰고, ML-KEM-768을 X25519와 함께 TLS 키 교환에 쓰며,
+SHA-256에만 의존하는 범위 증명을 제공합니다.
 
 > **현재 상태.** 실제 구현과 전 구간 테스트를 갖춘 연구용 소프트웨어입니다. 인증받은 의료기기가 아니고, 사용한다고 해서 HIPAA나 GDPR을
 > 자동으로 준수하게 되지도 않습니다. 실제로 사용하기 전에 [보안 모델과 한계](#16-보안-모델과-한계)를 읽으시고, 자체 검토 없이 실제 환자
@@ -89,9 +90,9 @@ Rust로 작성했으며, Python, TypeScript, Go에서 쓸 수 있는 WebAssembly
 **암호학적 파기(cryptographic shredding)**는 삭제권을 위한 기법입니다. 환자별 기록마다 별도의 키를 둡니다. 그 키를 파기하면 암호문 백업과 불변
 원장에 남은 복사본을 포함해 기록의 모든 복사본이 읽을 수 없게 됩니다.
 
-**양자 내성**은 미래의 대형 양자 컴퓨터에도 안전하다는 뜻입니다. CKKS와 BFV는 효율적인 양자 공격이 알려지지 않은 격자 문제에 기반하며, ML-DSA 서명도
-마찬가지입니다. 빠른 증명과 TLS 인증서에 쓰이는 타원곡선은 양자 컴퓨터를 견디지 못합니다. 어느 부분이 어느 쪽인지는 [16절](#16-보안-모델과-한계)에
-분명히 적어 두었습니다.
+**양자 내성**은 미래의 대형 양자 컴퓨터에도 안전하다는 뜻입니다. CKKS와 BFV는 효율적인 양자 공격이 알려지지 않은 격자 문제에 기반하며, ML-DSA 서명과 ML-KEM 키 교환도
+마찬가지입니다. 해시 함수도 견디므로 양자 내성 범위 증명은 해시에 기반합니다. 타원곡선은 견디지 못하는데, 빠른 Pedersen 증명과 TLS 인증서는 아직 타원곡선을 씁니다.
+어느 부분이 어느 쪽인지는 [16절](#16-보안-모델과-한계)에 분명히 적어 두었습니다.
 
 ---
 
@@ -100,16 +101,16 @@ Rust로 작성했으며, Python, TypeScript, Go에서 쓸 수 있는 WebAssembly
 | 기능 | 방법 | 위치 |
 | :--- | :--- | :--- |
 | 실수 벡터 암호 연산 | `N = 8192` 또는 `16384`의 RNS-CKKS. HE Standard 표 기준 양자 내성 128비트 | [`crates/medcrypto-fhe`](crates/medcrypto-fhe) |
-| 정확한 정수 암호 연산 | 같은 소수 위의 RNS-BFV, `N`개 슬롯 배칭 | [`bfv.rs`](crates/medcrypto-fhe/src/bfv.rs) |
+| 정확한 정수 암호 연산 | 같은 소수 위의 RNS-BFV, `N`개 슬롯 배칭, 임계 복호화, 데몬, 명령줄, Wasm | [`bfv.rs`](crates/medcrypto-fhe/src/bfv.rs) |
 | 곱셈, 재선형화, 재스케일 | 소수당 숫자 하나를 쓰는 하이브리드 키 스위칭 | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) |
 | 슬롯 회전 | Galois 키, NTT 영역 순열로 적용 | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) |
 | 암호문 상태 임상 스코어링 | 선형 모델, 3차 다항식, 로지스틱 곡선 | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) |
 | 단독 키 보유자 없음 | k-of-n 키 생성과 임계 복호화 | [`threshold.rs`](crates/medcrypto-fhe/src/threshold.rs) |
 | EMR 입력 | FHIR R4 파싱, LOINC, UCUM 변환, 윈저화, 결측치 대체 | [`crates/medcrypto-fhir`](crates/medcrypto-fhir) |
 | 환자별 패킹과 코호트 패킹 | `RecordEnvelope`, `CohortBatch` | [`src/packing`](src/packing) |
-| 범위 증명 | ristretto255 위의 Pedersen 커밋먼트, 외부 prover로 교체 가능 | [`src/zkp`](src/zkp) |
-| 다기관 데몬 | gRPC + 상호 TLS, 서명된 메시지, 중앙 서버 없음 | [`src/consortium`](src/consortium) |
-| 양자 내성 서명 | ML-DSA-65(FIPS 204)와 Ed25519를 함께 사용, 둘 다 통과해야 유효 | [`signatures.rs`](src/signatures.rs) |
+| 범위 증명 | 해시 기반 양자 내성, 속도용 ristretto255 Pedersen, 또는 외부 prover | [`src/zkp`](src/zkp), [`range_proof.rs`](crates/medcrypto-pq/src/range_proof.rs) |
+| 다기관 데몬 | X25519와 ML-KEM-768 하이브리드 키 교환의 gRPC + 상호 TLS, 서명된 메시지, 중앙 서버 없음 | [`src/consortium`](src/consortium) |
+| 양자 내성 서명 | ML-DSA-65(FIPS 204)와 Ed25519를 함께 사용, 둘 다 통과해야 유효 | [`signatures.rs`](crates/medcrypto-pq/src/signatures.rs) |
 | 동의 관리 | 파일 원장, 또는 JSON-RPC를 통한 스마트 컨트랙트 | [`consent.rs`](src/consortium/consent.rs), [`ConsentRegistry.sol`](contracts/ConsentRegistry.sol) |
 | 파기와 감사 | 레코드별 키를 요청 시 파기, 해시 체인 감사 로그 | [`src/compliance`](src/compliance/mod.rs) |
 | 다른 언어 지원 | import가 전혀 없는 Wasm Component | [`component`](component) |
@@ -118,8 +119,8 @@ Rust로 작성했으며, Python, TypeScript, Go에서 쓸 수 있는 WebAssembly
 
 ## 3. 설치와 빌드
 
-안정 버전 Rust 툴체인이 필요합니다(1.99에서 테스트). gRPC 정의를 순수 Rust로 컴파일하므로 `protoc`은 필요 없습니다. 암호 연산을 위해 설치할
-C 라이브러리도 없습니다.
+안정 버전 Rust 툴체인(1.99에서 테스트)과, TLS 라이브러리 빌드에 쓰이는 C 컴파일러가 필요합니다. gRPC 정의를 순수 Rust로 컴파일하므로 `protoc`은 필요 없습니다. 동형암호와
+증명 크레이트는 unsafe 코드 없는 순수 Rust입니다.
 
 ```bash
 git clone https://github.com/Aetherx86/medcrypto.git
@@ -335,6 +336,17 @@ cat consortium/hospital-b/data/results/*.json | jq -c '.analytes[]'
 
 각 노드에는 자신이 기여하고 공개한 내용을 기록한 해시 체인 `data/audit.json`도 생깁니다.
 
+**같은 연구를 정확한 값으로.** 연구에 `scheme`만 추가하면 나머지는 같습니다. 같은 공동 키, 같은 2-of-3 복호화, 같은 명령을 씁니다. 값은 `fixed_point` 배율로 정수가 되므로 100이면
+소수 둘째 자리까지 유지합니다.
+
+```json
+"scheme": {"type": "bfv", "plain_bits": 50, "fixed_point": 100}
+```
+
+```json
+{"status":"released","analyte":"systolic_bp","unit":"mm[Hg]","count":1000,"mean":135.49024,"variance":425.5489,"standard_deviation":20.6288}
+```
+
 이어서 해 볼 만한 실험: 새 epoch를 승인하기 전에 환자 한 명의 동의를 철회해 환자 수가 줄어드는지 확인하기, `min_cell_size`를 코호트보다 크게 잡아
 결과가 `suppressed`로 나오는지 확인하기, 키 생성 후 데몬 하나를 끄고 나머지 둘만 참여하는 연구가 끝까지 진행되는지 확인하기.
 
@@ -397,15 +409,17 @@ The committed value is at most 65, with nothing else revealed about it.
 
 거짓 주장에는 증명이 만들어지지 않고, 증명 파일의 임계값을 고치면 검증에 실패합니다. 이 범위에서 증명 크기는 2,242바이트입니다.
 
-프로덕션에서는 양자 내성 백엔드를 요청합니다. 프로덕션 프로파일에서 Pedersen 백엔드는 거부됩니다.
+프로덕션에서는 SHA-256에만 의존하는 양자 내성 백엔드를 씁니다. 프로덕션 프로파일에서 Pedersen 백엔드는 거부됩니다.
 
 ```bash
 $M prove --value 58 --threshold 65 --profile production
-# [ERROR] proof backend: the production profile needs a STARK runner: the Pedersen backend is not post-quantum
+# [ERROR] proof backend: the production profile refuses the Pedersen backend, which is not post-quantum: use the hash backend
 
-$M prove --value 58 --threshold 65 --profile production --backend stark \
-  --guest-elf ./guest.elf --runner ./my-sp1-runner
+$M prove --value 58 --threshold 65 --profile production --backend hash --output pq.json
+$M verify --proof-file pq.json --profile production --backend hash
 ```
+
+증명 생성과 검증에 각각 약 40 ms가 걸리고 크기는 1.3 MB입니다. `--backend stark`로 외부 prover를 쓸 수도 있습니다.
 
 ---
 
@@ -518,10 +532,10 @@ CKKS는 근사값을 내므로 검사 수치에 맞습니다. BFV는 정확한 �
 | 곱셈 한계 | 재스케일로 소모되는 레벨 | 노이즈 예산, 재스케일 없음 |
 | 한계에 도달하면 | 레벨 부족으로 거부 | 틀린 답이 조용히 나오므로 `noise_budget_bits` 확인 필요 |
 | 오버플로 시 | 인코딩에서 거부 | `t`를 법으로 순환하므로 어떤 결과보다 큰 `t`를 선택 |
-| 데몬 사용 여부 | 사용 | 미사용. 현재는 라이브러리 전용 |
+| 데몬, 명령줄, Wasm 지원 | 지원 | 지원 |
 
 ```rust
-let bfv = BfvEngine::new(CkksPreset::N8192, 20)?;      // 20비트 평문 모듈러스.
+let bfv = BfvEngine::new(CkksPreset::N8192, 20)?;      // 20비트 평문 모듈러스. 최대 50비트.
 let (secret, public) = bfv.keygen();
 let relin = bfv.relin_keygen(&secret);
 let x = bfv.encrypt(&public, &[1000, -2000, 3])?;
@@ -542,7 +556,22 @@ assert_eq!(bfv.decrypt(&secret, &product)?, [5000, -120000, -21]);
 | `N16384` | 30비트 | 283 | 239, 196, 153, 109, 65, 21 | 6 |
 | `N16384` | 40비트 | 261 | 207, 154, 100, 47 | 4 |
 
-`t`는 `2N`으로 나눈 나머지가 1인 소수여야 하고, 작은 값 중에는 그런 소수가 드뭅니다. `N16384`에서 가장 큰 20비트 값은 786433입니다.
+`t`는 `2N`으로 나눈 나머지가 1인 소수여야 하고, 작은 값 중에는 그런 소수가 드뭅니다. `N16384`에서 가장 큰 20비트 값은 786433입니다. 코호트 통계는 덧셈만 쓰므로 합계에 충분한
+50비트 `t`를 씁니다.
+
+**명령줄에서.** 코호트 패킹은 `--scheme bfv`를 주면 되고, `cohort-merge`와 `cohort-stats`는 입력 종류를 알아서 인식합니다.
+
+```bash
+M=./target/release/medcrypto
+$M bfv-encrypt --values 1000,-2000,3 --public-key keys/public-key.json --output ints.json
+$M bfv-decrypt --input ints.json --secret-key keys/secret-key.json     # 1000, -2000, 3
+
+$M ingest-fhir --bundle site-a.json --loinc-filter 8480-6,4548-4 --mode vertical \
+  --scheme bfv --fixed-point 100 --public-key keys/public-key.json --output a.bfv.json
+$M cohort-stats --input a.bfv.json --keys keys
+```
+
+암호화 상태의 오버플로는 나중에 알아챌 수 없으므로, 다른 병원 몫의 여유를 두고도 제곱합이 `t`에 닿을 수 있는 코호트는 패킹 단계에서 거부합니다.
 
 **정확한 스케일링.** BFV 곱셈에는 `Q`에 담기지 않는 큰 `x`에 대한 `round(t * x / Q)`가 필요합니다. 일반적인 RNS 방식은 부동소수로 근사하지만, 여기서는 워드 연산만으로
 정확히 계산합니다. 각 다항식을 균형 혼합 기수(balanced mixed-radix)로 `Q`에서 보조 기저 `B`로 올리고 `Q * B`에서 곱합니다. 그다음 `y = t * x + floor(Q / 2)`를 `Q * z + r`로
@@ -552,7 +581,8 @@ assert_eq!(bfv.decrypt(&secret, &product)?, [5000, -120000, -21]);
 **연산.** `add`, `sub`, `negate`, `add_plain`, `multiply_plain`, `multiply`, `relinearize`, `multiply_relin`, `rotate_rows`, `swap_rows`, `sum_all`, `noise_budget_bits`. `sum_all`은
 `sum_galois_keygen`의 키로 모든 슬롯에 `N`개 전체의 합계를 넣습니다.
 
-키 타입은 같지만 BFV와 CKKS에는 서로 다른 키를 쓰세요.
+두 방식은 같은 종류의 키를 쓰므로 컨소시엄의 공동 키 하나로 모두 처리하며, 이전 버전의 키도 BFV에 그대로 쓸 수 있습니다. `sum_rows`는 슬롯 첫 행의 값에 대해 그 키에 이미 있는 회전 키만
+필요로 하며, 코호트가 이 방식을 씁니다.
 
 ### 로드맵 초안과 달라진 API
 
@@ -679,12 +709,26 @@ pub trait ZkPredicateProver {
 }
 ```
 
-| 백엔드 | 가정 | 양자 내성 | 필요한 것 | 용도 |
-| :--- | :--- | :--- | :--- | :--- |
-| `PedersenBackend` | ristretto255의 이산로그 | 아니요 | 없음 | 병원 내부 개발과 테스트 |
-| `StarkCoprocessorBackend` | prover에 따라 다름. 보통 해시 기반 | 러너가 그러하면 | 외부 러너와 guest 프로그램 | 감사와 프로덕션 |
+| 백엔드 | 가정 | 양자 내성 | 크기 | 필요한 것 | 용도 |
+| :--- | :--- | :--- | ---: | :--- | :--- |
+| `PedersenBackend` | ristretto255의 이산로그 | 아니요 | 2.2 KiB | 없음 | 병원 내부 개발과 테스트 |
+| `HashBasedBackend` | SHA-256만 | 예 | 1.3 MB | 없음 | 프로덕션 |
+| `StarkCoprocessorBackend` | prover에 따라 다름. 보통 해시 기반 | 러너가 그러하면 | prover에 따라 다름 | 외부 러너와 guest 프로그램 | 증명이 작아야 할 때 |
 
 `--profile production`은 `backend_for_profile`을 통해 `PedersenBackend`를 거부합니다.
+
+### 해시 기반 범위 증명의 원리
+
+[`range_proof.rs`](crates/medcrypto-pq/src/range_proof.rs)는 ZKBoo 방식의 MPC-in-the-head를 씁니다. 커밋먼트는 `SHA-256("mcrange1" || value || blinding)`이고, 증명할 명제는 그 해시를 가진
+값과 블라인딩을 안다는 것과 `min <= value <= max`입니다.
+
+증명자는 비밀을 XOR하면 원래 값이 되는 무작위 조각 3개로 나누고, 세 참여자가 명제 전체(SHA-256 64라운드와 64비트 비교 2개)를 함께 계산한다고 상상합니다. XOR 게이트는 각자 계산합니다. AND
+게이트에서는 참여자가 자기 조각과 다음 참여자의 조각, 무작위 테이프를 결합합니다. 그래서 어느 두 참여자의 뷰를 합쳐도 비밀에 대해 아무것도 알 수 없고, 계산에는 셋 모두가 필요합니다.
+
+증명자는 세 뷰 모두에 커밋하고, 전체의 해시가 공개할 둘을 고릅니다(Fiat-Shamir). 어디서든 속이면 세 쌍 중 적어도 하나가 어긋나므로 라운드마다 1/3 이상의 확률로 걸립니다. 438라운드면 통과 확률은
+`(2/3)^438`, 약 `2^-256`입니다. Grover 알고리즘은 운 좋은 챌린지 탐색을 제곱근으로 줄이므로 약 128비트가 남습니다. 테스트에서 속이는 증명자를 같은 프로토콜로 돌리면 실패합니다.
+
+외부 도구가 필요 없고 해시 외의 가정도 없습니다. 대신 라운드마다 회로 기록을 담으므로 크기가 큽니다.
 
 ### Pedersen 범위 증명의 원리
 
@@ -762,7 +806,8 @@ prover를 연결해 실행해 본 적은 없고**, [`zk/guest-range`](zk/guest-r
 
 ### 모든 메시지에 대한 신뢰 검사
 
-1. **TLS.** 연결의 양쪽 모두 인증서가 컨소시엄 CA로 이어져야 합니다.
+1. **TLS.** 연결의 양쪽 모두 인증서가 컨소시엄 CA로 이어져야 합니다. 키 교환은 X25519와 ML-KEM-768 하이브리드라서, 지금 녹화한 트래픽을 나중에 양자 컴퓨터로 풀 수 없습니다. 이 그룹만
+   제시해 실행 중인 데몬과 핸드셰이크하는 테스트로 확인합니다.
 2. **로스터.** 인증서의 SHA-256이 로스터에 적힌 발신자의 값과 같아야 합니다. CA조차 모든 노드의 로스터를 바꾸지 않고는 구성원을 추가할 수 없습니다.
 3. **서명.** Ed25519와 ML-DSA-65 서명이 모두 컨소시엄, 발신자, 수신자, 페이로드 해시를 포함해야 합니다. 따라서 녹화된 메시지를 다른 노드나 다른 컨소시엄에 재전송할 수 없습니다.
 4. **프로토콜.** 조각이나 부분 복호화는 주장한 참여자의 것이어야 합니다. 암호문은 사용 전에 모든 나머지가 소수보다 작은지까지 전수 검증합니다.
@@ -771,7 +816,7 @@ gRPC 서비스는 [`proto/consortium.proto`](proto/consortium.proto)에 정의�
 
 ### 하이브리드 서명
 
-[`signatures.rs`](src/signatures.rs)는 각 메시지에 Ed25519와 ML-DSA-65(FIPS 204)로 함께 서명하고, 검증은 둘 다 통과해야 합니다.
+[`signatures.rs`](crates/medcrypto-pq/src/signatures.rs)는 각 메시지에 Ed25519와 ML-DSA-65(FIPS 204)로 함께 서명하고, 검증은 둘 다 통과해야 합니다.
 
 - ML-DSA가 양자 컴퓨터에 대응하는 부분입니다. Ed25519는 Shor 알고리즘에 깨집니다.
 - ML-DSA는 역사가 짧아 Ed25519를 함께 둡니다. ML-DSA나 이 구현에서 결함이 나와도 위조하려면 Ed25519까지 깨야 합니다. 서명의 어느 한쪽을 지우거나 바꾸면 무효가 됩니다.
@@ -827,6 +872,29 @@ $M verify-signature --public-key sign/signing-public.json --input results.json -
 병원별로 나눠 줄 때는 해당 병원의 디렉터리와 `ca.pem`, `roster.json`, `studies.json`을 복사합니다. `ca-key.pem`은 어느 병원에도 주지 않습니다. 그런 다음 `node.json`의
 경로를 고칩니다.
 
+### 이전 버전의 키
+
+다시 만들 것이 없습니다. 키 조각, 공동 키, 인증서, 신원이 모두 그대로 이어지며, 모든 형식은 이전 버전을 읽습니다.
+
+- **0.3.x** 로스터는 그대로 동작합니다.
+- **0.2.x** 로스터에는 Ed25519만 있습니다. 해당 노드는 같은 키로 그 버전 방식대로 서명하며 계속 동작하므로, 업그레이드 중에 이전 노드와 새 노드가 함께 돌 수 있습니다. 각 노드의 시드 파일에서 ML-DSA
+  키도 나옵니다.
+
+모든 노드가 이 버전을 실행하게 되면 0.2.x 컨소시엄을 하이브리드 서명으로 올릴 수 있습니다.
+
+```bash
+# 병원마다 실행합니다. 출력에는 공개키만 있습니다.
+$M consortium-export-key --config consortium/hospital-a/node.json --output hospital-a.key.json
+
+# 전체를 모아 한 번 실행한 뒤, 모든 노드에 새 로스터를 배포합니다.
+$M consortium-import-keys --roster consortium/roster.json hospital-a.key.json hospital-b.key.json hospital-c.key.json
+```
+
+가져오기는 Ed25519 키가 같은 노드에만 키를 추가하므로 다른 노드의 신원을 가로챌 수 없습니다. ML-DSA 키가 있는 항목은 다시는 Ed25519 단독 서명을 받지 않으므로 다운그레이드도 불가능합니다. 테스트에서 이전
+로스터로 연구를 돌리고, 업그레이드하고, 다시 연구를 돌린 뒤 키 조각이 1바이트도 바뀌지 않았는지 확인합니다.
+
+0.2.0 이후의 파일 형식은 그대로 읽힙니다. 다만 이 버전에서 Wasm export 이름이 `@0.2.0`에서 `@0.4.0`으로 바뀌었으므로, 이름을 직접 쓰는 호스트는 문자열을 고쳐야 합니다. 키와 암호문 자체는 그대로입니다.
+
 ### 알려진 운영 한계
 
 - 키 생성 후 재시작은 디스크에서 키를 복원합니다. 키 생성 **도중** 재시작하면 모든 노드에서 키 생성을 다시 해야 합니다.
@@ -864,7 +932,9 @@ d_j = lambda_j * share_j * c1 + smudge_j
 **스머징 잡음**은 중요합니다. 이 잡음이 없으면 부분 복호화가 암호문의 오차항을 드러내고, CKKS에서는 그것으로 키가 누출될 수 있습니다(Li와 Micciancio의 공격). 각 참여자는
 `[-2^b, 2^b)` 균등 잡음을 더합니다. 로스터의 `smudging_bits` 기본값 `b = 24`는 스케일 `2^40`, `N = 8192`에서 복호화 값에 참여자당 약 `2^-9`의 절대 잡음을 남깁니다.
 
-**이것의 의미를 알아 두세요.** 이 잡음과 암호문 자체 잡음의 비는 많아야 `2^14` 정도로, 잡음 플러딩 방식의 보안 증명이 요구하는 통계적으로 무시할 수 있는 거리에는 크게
+BFV는 메시지를 이 잡음보다 훨씬 높은 비트에 담으므로, `BFV_SMUDGING_BITS`의 `b = 50`을 써도 정확한 결과에 영향이 없습니다.
+
+**이것의 의미를 알아 두세요.** CKKS에서 이 잡음과 암호문 자체 잡음의 비는 많아야 `2^14` 정도로, 잡음 플러딩 방식의 보안 증명이 요구하는 통계적으로 무시할 수 있는 거리에는 크게
 못 미칩니다. `smudging_bits`를 올리면 나아지지만 그만큼 정밀도가 떨어지고, `2^40` 스케일에서는 여유가 많지 않습니다. 현재 값은 프로토콜을 따르는 참여자를 위한 다층 방어의
 한 겹으로 여기세요.
 
@@ -909,8 +979,33 @@ interface fhe-ops {
 }
 ```
 
-CKKS를 `N = 8192`에서 실행하며, BFV와 하이브리드 서명은 아직 컴포넌트에 없습니다. 로드맵 초안과 의도적으로 세 가지가 다릅니다. 이 컴포넌트에는 난수 소스가 없으므로 `encrypt-vector`가 `entropy`를 받고, 입력이 잘못될 수 있으므로
+CKKS를 `N = 8192`에서 실행합니다. 로드맵 초안과 의도적으로 세 가지가 다릅니다. 이 컴포넌트에는 난수 소스가 없으므로 `encrypt-vector`가 `entropy`를 받고, 입력이 잘못될 수 있으므로
 함수가 `result`를 반환하며, 없으면 쓸 수 없으므로 `keygen`과 `decrypt-vector`를 추가했습니다.
+
+### `bfv-ops`와 `pq-signatures` 인터페이스
+
+```wit
+interface bfv-ops {
+    record bfv-ciphertext { data: list<u8>, degree: u32, plain-modulus: u64 }
+
+    keygen: func(entropy: list<u8>) -> result<fhe-keypair, fhe-error>;
+    relin-keygen: func(sk: list<u8>, entropy: list<u8>) -> result<list<u8>, fhe-error>;
+    encrypt: func(pk: list<u8>, plain-bits: u32, values: list<s64>, entropy: list<u8>) -> result<bfv-ciphertext, fhe-error>;
+    decrypt: func(sk: list<u8>, a: bfv-ciphertext) -> result<list<s64>, fhe-error>;
+    add: func(a: bfv-ciphertext, b: bfv-ciphertext) -> result<bfv-ciphertext, fhe-error>;
+    multiply: func(a: bfv-ciphertext, b: bfv-ciphertext, relin-key: list<u8>) -> result<bfv-ciphertext, fhe-error>;
+    noise-budget: func(sk: list<u8>, a: bfv-ciphertext) -> result<f64, fhe-error>;
+}
+
+interface pq-signatures {
+    record hybrid-public-key { ed25519: list<u8>, ml-dsa65: list<u8> }
+    record hybrid-signature { ed25519: list<u8>, ml-dsa65: list<u8> }
+
+    public-key-from-seed: func(seed: list<u8>) -> result<hybrid-public-key, crypto-error>;
+    sign: func(seed: list<u8>, context: list<u8>, message: list<u8>, entropy: list<u8>) -> result<hybrid-signature, crypto-error>;
+    verify: func(public-key: hybrid-public-key, context: list<u8>, message: list<u8>, signature: hybrid-signature) -> bool;
+}
+```
 
 **import가 전혀 없습니다.** 파일, 시계, 네트워크, 난수에 접근하지 않으며 CI가 빌드마다 확인합니다. 그래서 버그가 있어도 할 수 있는 일은 틀린 답을 계산하는 것뿐입니다. 난수는
 호출자가 줘야 합니다. `keygen`과 각 `encrypt-vector`에 암호학적 소스에서 얻은 새 32바이트를 주고 절대 재사용하지 마세요. 전부 0인 값은 고장 난 난수 소스의 전형이므로 거부합니다.
@@ -925,6 +1020,19 @@ secret = bytes(getattr(pair, "secret-key"))
 a = m.fhe_call("encrypt-vector", public, [120.5, 80.0, 5.75], secrets.token_bytes(32))
 b = m.fhe_call("encrypt-vector", public, [10.0, 20.0, 0.25], secrets.token_bytes(32))
 print(m.fhe_call("decrypt-vector", secret, m.fhe_call("homomorphic-add", a, b)))
+
+# 정확한 정수
+pair = m.bfv_call("keygen", secrets.token_bytes(32))
+public = bytes(getattr(pair, "public-key"))
+secret = bytes(getattr(pair, "secret-key"))
+a = m.bfv_call("encrypt", public, 20, [1000, -2000, 3], secrets.token_bytes(32))
+print(m.bfv_call("decrypt", secret, m.bfv_call("add", a, a)))   # [2000, -4000, 6]
+
+# 양자 내성 서명
+seed = secrets.token_bytes(32)
+public = m.pq_call("public-key-from-seed", seed)
+signature = m.pq_call("sign", seed, b"release", b"count: 1500", secrets.token_bytes(32))
+print(m.pq_call("verify", public, b"release", b"count: 1500", signature))   # True
 ```
 
 ```javascript
@@ -935,6 +1043,16 @@ const { publicKey, secretKey } = fheOps.keygen(random());
 const a = fheOps.encryptVector(publicKey, Float64Array.of(120.5, 80.0, 5.75), random());
 const doubled = fheOps.homomorphicScalarMul(a, 2.0);
 console.log(fheOps.decryptVector(secretKey, doubled));
+
+// 정확한 정수, BigInt 사용
+const keys = bfvOps.keygen(random());
+const x = bfvOps.encrypt(keys.publicKey, 20, BigInt64Array.of(1000n, -2000n, 3n), random());
+console.log(bfvOps.decrypt(keys.secretKey, bfvOps.add(x, x)));
+
+// 양자 내성 서명
+const seed = random();
+const signature = pqSignatures.sign(seed, text("release"), text("count: 1500"), random());
+console.log(pqSignatures.verify(pqSignatures.publicKeyFromSeed(seed), text("release"), text("count: 1500"), signature));
 ```
 
 `component/hosts/`의 호스트들은 같은 파일을 실행해 [`expected.txt`](component/hosts/expected.txt)와 똑같이 출력해야 하고, 네이티브 테스트가 그 파일을 Rust 코드와 대조합니다.
@@ -957,8 +1075,8 @@ Python과 TypeScript는 실제 컴포넌트 런타임(`wasmtime`, `jco`)을 씁�
 Canonical ABI를 직접 처리합니다. 같은 컴파일 코드지만 손이 더 가며, 컴포넌트에 import가 없기 때문에 이렇게 간단히 가능합니다. 레코드의 `f64`가 메모리 배치를 어떻게 바꾸는지도
 이 호스트에서 볼 수 있습니다.
 
-기대 출력은 복호화 값을 반올림합니다. 네이티브와 Wasm의 부동소수 라이브러리는 마지막 비트가 다를 수 있어 인코더의 반올림이 달라지므로, 플랫폼 간 암호문은 비교하지 않습니다. 복호화
-결과에는 영향이 없습니다.
+기대 출력은 CKKS 값을 반올림합니다. 네이티브와 Wasm의 부동소수 라이브러리는 마지막 비트가 다를 수 있어 인코더의 반올림이 달라지므로, CKKS 암호문은 플랫폼 간에 비교하지 않습니다. 복호화 결과에는 영향이
+없습니다. BFV와 서명에는 부동소수가 없어 모든 플랫폼에서 바이트까지 정확히 비교합니다.
 
 ---
 
@@ -1070,13 +1188,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | :--- | :--- | :--- |
 | 프리셋의 CKKS, BFV | RLWE, 표준 표 기준 128비트 | 효율적인 공격 알려지지 않음 |
 | 컨소시엄 메시지 서명 | ML-DSA-65와 Ed25519, 둘 다 필요 | ML-DSA가 유지되는 한 안전 |
+| 노드 간 및 FHIR, RPC 서버로의 TLS 키 교환 | X25519와 ML-KEM-768 함께 사용 | ML-KEM이 유지되는 한 안전. 이를 지원하지 않는 원격 서버는 가장 좋은 고전 방식으로 대체 |
+| 해시 기반 범위 증명 | SHA-256 | Grover 기준 약 128비트 |
 | SHA-256 체인, AES-256-GCM | 대칭키 | Grover 기준 약 128비트 |
-| Pedersen 증명 | 타원곡선 이산로그 | **깨짐** |
-| TLS 인증서와 키 교환 | `rustls`가 협상한 방식, 타원곡선 인증서 | **인증서 깨짐.** 지금 녹화한 트래픽이 나중에 복호화될 수 있음 |
+| Pedersen 증명, 개발 전용 | 타원곡선 이산로그 | **깨짐**. 프로덕션에서 거부 |
+| TLS 인증서 | ECDSA | **깨짐.** 실시간 사칭에만 해당하며, 메시지마다 하이브리드 서명이 유효해야 함 |
 | 동의 컨트랙트 | 이더리움 자체 서명 | 해당 체인에서 **깨짐** |
 
-따라서 동형암호와 메시지 서명은 양자 내성이고, **TLS와 Pedersen 증명은 그렇지 않습니다.** 네트워크에서 녹화된 암호문은 CKKS 계층이 계속 보호하지만, 키 생성 중
-전송되는 비밀 조각은 TLS에만 의존합니다. 공격자가 지금 트래픽을 녹화해 두고 나중에 양자 컴퓨터를 갖는다면 문제가 됩니다.
+따라서 동형암호, 메시지 서명, 키 교환, 프로덕션 범위 증명은 양자 내성이고, 타원곡선으로 남은 것은 X.509 인증서, 개발용 증명, 체인 자체의 서명입니다. 지금 트래픽을 녹화해도 미래의 양자 컴퓨터에 도움이 되지
+않습니다. 키 생성 중의 비밀 조각은 하이브리드 키 교환이, 암호문은 RLWE까지 함께 보호합니다.
+
+ML-KEM과 ML-DSA는 역사가 짧아 고전 알고리즘을 대체하지 않고 함께 씁니다. 한쪽만 깨서는 소용이 없습니다.
 
 ---
 
@@ -1144,10 +1266,11 @@ Apple M4에서 릴리스 모드, 단일 스레드로 `cargo run --release --exam
 | 서명 | 0.24 | 서명 3373바이트 |
 | 검증 | 0.10 | |
 
-| 범위 증명(Pedersen) | 증명 (ms) | 검증 (ms) | 크기 |
+| 범위 증명 | 증명 (ms) | 검증 (ms) | 크기 |
 | :--- | ---: | ---: | ---: |
-| `[0, 65]` | 2.04 | 1.91 | 2.2 KiB |
-| 32비트 범위 | 8.82 | 9.21 | 10 KiB |
+| Pedersen, `[0, 65]` | 2.04 | 1.91 | 2.2 KiB |
+| Pedersen, 32비트 범위 | 8.82 | 9.21 | 10 KiB |
+| 해시 기반, 모든 범위 | 38 | 45 | 1.3 MB |
 
 환자 1500명, 항목 3개의 3노드 튜토리얼은 노트북 한 대에서 키 생성과 연구까지 모두 수십 초 안에 끝났습니다. 실제 배포에서는 대역폭이 가장 큰 비용입니다. 각 참여자는 다른 노드마다
 `3 x 항목 수 x 배치 수`개의 암호문을 보내고, 각 노드는 키 생성 중에 회전 키 조각을 보냅니다.
@@ -1156,7 +1279,7 @@ Apple M4에서 릴리스 모드, 단일 스레드로 `cargo run --release --exam
 
 ## 19. 명령어 참조
 
-BFV 전용 명령은 아직 없으며 `demo`와 라이브러리에서 실행됩니다. 어느 명령이든 `--help`로 전체 옵션을 볼 수 있습니다.
+어느 명령이든 `--help`로 전체 옵션을 볼 수 있습니다.
 
 | 명령 | 하는 일 |
 | :--- | :--- |
@@ -1166,6 +1289,7 @@ BFV 전용 명령은 아직 없으며 `demo`와 라이브러리에서 실행됩�
 | `keygen` | 비밀키, 공개키, 회전 키, 재선형화 키 작성 |
 | `encrypt` | 환자 한 명의 바이탈 암호화 |
 | `decrypt` | 암호문 파일 복호화 |
+| `bfv-encrypt`, `bfv-decrypt` | BFV로 정수를 암호화하고 정확히 복호화, 노이즈 예산 표시 |
 | `ingest-fhir` | FHIR 서버 또는 번들을 수직 암호문, 수평 엔벨로프, 평문 표로 변환 |
 | `batch-pack` | `PatientRecord` 파일이나 번들 디렉터리를 수직 암호문으로 변환 |
 | `cohort-merge` | 여러 병원 코호트 결합 |
@@ -1178,6 +1302,7 @@ BFV 전용 명령은 아직 없으며 `demo`와 라이브러리에서 실행됩�
 | `sign`, `verify-signature` | 두 알고리즘으로 파일 서명과 검증 |
 | `quantum-audit` | 파라미터를 HE Standard와 대조 |
 | `consortium-init` | CA, 인증서, 키, 로스터, 노드 설정 생성 |
+| `consortium-export-key`, `consortium-import-keys` | 0.3.0 이전 로스터를 새 키 없이 하이브리드 서명으로 업그레이드 |
 | `daemon run` | 중단할 때까지 노드 실행 |
 | `daemon status` | 노드 상태 조회 |
 
@@ -1196,6 +1321,9 @@ BFV 전용 명령은 아직 없으며 `demo`와 라이브러리에서 실행됩�
 | `--pseudonym-key` | 출력 옆 | 병원 비밀값, 없으면 생성 |
 | `--key-store` | `medcrypto-keystore.json` | 수평 모드의 엔벨로프 키 |
 | `--allow-insecure-http` | 꺼짐 | 원격 호스트에 `http://` 허용 |
+| `--scheme` | `ckks` | `ckks`, 또는 정확한 결과를 내는 `bfv`. `batch-pack`에도 있음 |
+| `--fixed-point` | 10 | BFV: 값에 곱하는 배율. 10이면 소수 첫째 자리까지 유지 |
+| `--plain-bits` | 50 | BFV: 평문 모듈러스 크기 |
 
 종료 코드는 성공 시 0, 검증에 실패한 증명을 포함한 모든 오류에서 1, 라이선스 문제에서 126입니다.
 
@@ -1229,6 +1357,8 @@ BFV 전용 명령은 아직 없으며 `demo`와 라이브러리에서 실행됩�
                "winsorized": 0, "missing": 0, "imputed": 0}]
 }
 ```
+
+BFV 코호트도 형태가 같으며, `"format": "medcrypto-bfv-cohort-v1"`이고 `plain_bits`, `plain_modulus`, `fixed_point`가 추가됩니다.
 
 **표**(`--mode table`, 병원 내 보관)
 
@@ -1294,14 +1424,14 @@ cargo run --example clinical_ai_benchmark
 medcrypto/
 ├── crates/
 │   ├── medcrypto-fhe/        RNS-CKKS, RNS-BFV, 임계 복호화. os-rng 없이는 OS 의존성 없음
-│   └── medcrypto-fhir/       FHIR 파싱, 용어, 정제, HTTP 클라이언트
+│   ├── medcrypto-fhir/       FHIR 파싱, 용어, 정제, HTTP 클라이언트
+│   └── medcrypto-pq/         하이브리드 서명과 해시 기반 범위 증명. os-rng 없이는 OS 의존성 없음
 ├── src/
 │   ├── main.rs               명령줄
 │   ├── packing/              수평 엔벨로프와 수직 코호트
-│   ├── zkp/                  ZkPredicateProver, Pedersen 범위 증명, STARK 어댑터
+│   ├── zkp/                  ZkPredicateProver: Pedersen, 해시 기반, STARK 어댑터
 │   ├── consortium/           로스터, 동의 소스, 프로토콜 상태 기계, gRPC와 TLS
 │   ├── compliance/           키 저장소, 파기, 감사 체인
-│   ├── signatures.rs         ML-DSA-65와 Ed25519 하이브리드 서명
 │   ├── quantum/              HE Standard 대조
 │   ├── blockchain/           DID와 동의 시뮬레이터, EVM calldata
 │   ├── clinical_ai/          약물 추천 샘플
@@ -1341,8 +1471,12 @@ cargo test --workspace --all-targets --all-features
 | FHIR | `crates/medcrypto-fhir/tests` | 파싱, 변환, 정제, 악의적 `next` 링크를 포함한 실제 소켓 클라이언트 |
 | 패킹 | `tests/packing_test.rs` | 통계가 평문과 일치, 결측치 제외, 파기가 프로세스를 넘어 유지 |
 | 범위 증명 | `tests/zkp_range_test.rs` | 정직한 증명 통과. 변조와 커밋먼트 이동 실패. 프로덕션이 Pedersen 거부. 러너 규칙 동작 |
+| 데몬의 BFV | `tests/consortium_test.rs` | 실제 노드를 거친 BFV 연구가 모든 노드에서 동일하고 정확한 결과를 냄 |
 | 데몬 | `tests/consortium_test.rs` | 상호 TLS의 실제 노드 3개가 동의와 셀 비공개를 적용해 맞는 통계를 얻음, 노드 하나 정지, 디스크에서 재시작. 외부 인증서 거부. 중간에 철회된 연구는 복호화되지 않음 |
-| 서명 | `src/signatures.rs`, `src/consortium/network.rs` | 키 생성이 NIST 벡터와 일치. 양쪽 모두 필요. 어느 한쪽이 없거나 다른 곳에 재전송된 메시지는 거부 |
+| 서명 | `crates/medcrypto-pq`, `src/consortium/network.rs` | 키 생성이 NIST 벡터와 일치. 양쪽 모두 필요. 어느 한쪽이 없거나 다른 곳에 재전송된 메시지는 거부. 하이브리드 항목은 다운그레이드 불가 |
+| 해시 기반 증명 | `crates/medcrypto-pq` | 회로가 실제 SHA-256을 계산. 프로토콜대로 속이는 증명자는 실패. 어디를 변조해도 실패 |
+| 양자 내성 TLS | `tests/consortium_test.rs` | X25519MLKEM768만 제시해 실행 중인 데몬과 실제 핸드셰이크 |
+| 키 호환 | `tests/consortium_test.rs`, `tests/cli_test.rs` | 0.2 형식 로스터로 연구, 업그레이드, 다시 연구, 키 조각 불변 확인 |
 | 동의 | `tests/evm_consent_test.rs` | ABI 인코딩, 실패 시 거부, Foundry가 있으면 실제 로컬 체인의 컨트랙트 |
 | 명령줄 | `tests/cli_test.rs` | 문서의 명령을 실제 바이너리로 실행 |
 | Wasm | `component/tests/vectors.rs` | 공개 벡터, 호스트 기대 출력의 정확성 |
@@ -1373,14 +1507,16 @@ cargo test --workspace --all-targets --all-features
 | FHIR 크레이트, `ingest-fhir` | 완료 | 로컬 모의 서버로 테스트. 실제 운영 EMR로는 테스트하지 않음 |
 | `ZkPredicateProver`, 실제 Pedersen 범위 증명 | 완료 | |
 | `StarkCoprocessorBackend` | 어댑터 완료 | **실제 prover로는 아직 실행하지 않음** |
+| 내장 양자 내성 범위 증명 | 완료 | SHA-256 위의 MPC-in-the-head |
+| 양자 내성 TLS 키 교환 | 완료 | X25519MLKEM768 |
 | gRPC, 상호 TLS 데몬 | 완료 | 정직하지만 호기심 있는 참여자 모델 |
 | 스마트 컨트랙트 동의 | 완료 | 로컬 체인에서만 테스트 |
 | k-of-n 키 생성과 임계 복호화 | 완료 | 검증 가능한 비밀 분배 없음 |
 | Wasm `fhe-ops` | 완료 | Python, TypeScript, Go |
-| RNS-BFV | 완료 | 라이브러리와 데모. 데몬, 명령줄, Wasm에는 아직 없음 |
+| RNS-BFV | 완료 | 라이브러리, 임계 복호화, 데몬, 명령줄, GUI, Wasm |
 | ML-DSA-65와 Ed25519 하이브리드 서명 | 완료 | 모든 데몬 메시지와 파일 |
 
-다음에 할 만한 일을 가치순으로 적으면 다음과 같습니다. 검증 가능한 비밀 분배와 부분 복호화 정확성 증명, 기여 값의 입력 범위 증명, 공개 통계의 차등 프라이버시, 양자 내성 TLS, 데몬의 BFV, 실제 SP1
+다음에 할 만한 일을 가치순으로 적으면 다음과 같습니다. 검증 가능한 비밀 분배와 부분 복호화 정확성 증명, 기여 값의 입력 범위 증명, 공개 통계의 차등 프라이버시, 양자 내성 인증서, 실제 SP1
 러너, 키 저장소의 HSM/KMS 연동, 구성원 변경을 위한 재공유.
 
 ---
@@ -1414,6 +1550,8 @@ cargo test --workspace --all-targets --all-features
 | BFV | `t`를 법으로 하는 정수의 정확한 연산을 위한 동형암호 방식 |
 | 노이즈 예산 | BFV 암호문이 잘못 복호화되기 전까지 더 견딜 수 있는 잡음의 양 |
 | ML-DSA | FIPS 204로 표준화된 격자 기반 서명 방식. 옛 이름은 Dilithium |
+| ML-KEM | FIPS 203으로 표준화된 격자 기반 키 교환. 옛 이름은 Kyber |
+| MPC-in-the-head | 여러 참여자의 계산을 시뮬레이션하고 일부를 공개해 명제를 증명하는 방식 |
 | RNS | 잉여 수 체계. 큰 수를 여러 작은 소수에 대한 나머지로 저장 |
 | RLWE | Ring Learning With Errors. CKKS 보안의 기반인 격자 문제 |
 | `N` | 다항식 링의 차수. 클수록 안전하고 느림 |

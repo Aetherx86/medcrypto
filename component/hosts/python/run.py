@@ -6,8 +6,10 @@ import sys
 from wasmtime import Engine, Store
 from wasmtime.component import Component, Linker
 
-API = "medcrypto:crypto/api@0.2.0"
-FHE = "medcrypto:crypto/fhe-ops@0.2.0"
+API = "medcrypto:crypto/api@0.4.0"
+FHE = "medcrypto:crypto/fhe-ops@0.4.0"
+BFV = "medcrypto:crypto/bfv-ops@0.4.0"
+PQ = "medcrypto:crypto/pq-signatures@0.4.0"
 
 
 class Medcrypto:
@@ -17,12 +19,20 @@ class Medcrypto:
         self.instance = Linker(engine).instantiate(self.store, Component.from_file(engine, path))
         self.api = self.instance.get_export_index(self.store, API)
         self.fhe = self.instance.get_export_index(self.store, FHE)
+        self.bfv = self.instance.get_export_index(self.store, BFV)
+        self.pq = self.instance.get_export_index(self.store, PQ)
 
     def call(self, name, *args):
         return self.call_in(self.api, name, *args)
 
     def fhe_call(self, name, *args):
         return self.call_in(self.fhe, name, *args)
+
+    def bfv_call(self, name, *args):
+        return self.call_in(self.bfv, name, *args)
+
+    def pq_call(self, name, *args):
+        return self.call_in(self.pq, name, *args)
 
     def call_in(self, interface, name, *args):
         index = self.instance.get_export_index(self.store, name, interface)
@@ -83,6 +93,34 @@ def main(path):
     garbage = copy.copy(a)
     setattr(garbage, "data", b"\x01\x02\x03")
     print("fhe-garbage", error_name(lambda: m.fhe_call("homomorphic-scalar-mul", garbage, 2.0)))
+
+    integers = lambda values: " ".join(str(v) for v in values)
+    pair = m.bfv_call("keygen", bytes([4]) * 32)
+    bfv_public, bfv_secret = bytes(getattr(pair, "public-key")), bytes(getattr(pair, "secret-key"))
+    print("bfv-public-key", show(m.call("sha256", bfv_public)))
+    relin = bytes(m.bfv_call("relin-keygen", bfv_secret, bytes([5]) * 32))
+    a = m.bfv_call("encrypt", bfv_public, 20, [1000, -2000, 3], bytes([6]) * 32)
+    b = m.bfv_call("encrypt", bfv_public, 20, [5, 60, -7], bytes([7]) * 32)
+    print("bfv-ciphertext", show(m.call("sha256", bytes(a.data))))
+    print("bfv-decrypt", integers(m.bfv_call("decrypt", bfv_secret, a)))
+    print("bfv-add", integers(m.bfv_call("decrypt", bfv_secret, m.bfv_call("add", a, b))))
+    product = m.bfv_call("multiply", a, b, relin)
+    print("bfv-multiply", integers(m.bfv_call("decrypt", bfv_secret, product)))
+    print("bfv-budget-left", lower(m.bfv_call("noise-budget", bfv_secret, product) > 1.0))
+    print("bfv-bad-entropy", error_name(lambda: m.bfv_call("keygen", bytes(32))))
+
+    seed = bytes([8]) * 32
+    public = m.pq_call("public-key-from-seed", seed)
+    ed, ml = bytes(public.ed25519), bytes(getattr(public, "ml-dsa65"))
+    print("pq-public-key", show(m.call("sha256", ed)), show(m.call("sha256", ml)))
+    signature = m.pq_call("sign", seed, b"ctx", b"message", bytes([9]) * 32)
+    print("pq-signature", show(m.call("sha256", bytes(signature.ed25519))), show(m.call("sha256", bytes(getattr(signature, "ml-dsa65")))))
+    print("pq-verify", lower(m.pq_call("verify", public, b"ctx", b"message", signature)))
+    print("pq-verify-wrong-message", lower(m.pq_call("verify", public, b"ctx", b"other", signature)))
+    stripped = copy.copy(signature)
+    setattr(stripped, "ml-dsa65", b"")
+    print("pq-verify-stripped", lower(m.pq_call("verify", public, b"ctx", b"message", stripped)))
+    print("pq-weak-seed", error_name(lambda: m.pq_call("public-key-from-seed", bytes(32))))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 // Runs the component from JavaScript, through the module that jco generates from it.
-import { api, fheOps } from "./generated/medcrypto.js";
+import { api, fheOps, bfvOps, pqSignatures } from "./generated/medcrypto.js";
 
 const h = (text) => Uint8Array.from(Buffer.from(text, "hex"));
 const show = (bytes) => Buffer.from(bytes).toString("hex");
@@ -49,3 +49,28 @@ console.log("fhe-scalar-mul", rounded(fheOps.decryptVector(fhe.secretKey, fheOps
 console.log("fhe-scalar-half", rounded(fheOps.decryptVector(fhe.secretKey, fheOps.homomorphicScalarMul(a, 0.5))));
 console.log("fhe-bad-entropy", errorName(() => fheOps.keygen(new Uint8Array(32))));
 console.log("fhe-garbage", errorName(() => fheOps.homomorphicScalarMul({ ...a, data: Uint8Array.of(1, 2, 3) }, 2.0)));
+
+const integers = (values) => Array.from(values, (v) => v.toString()).join(" ");
+const filled = (byte) => new Uint8Array(32).fill(byte);
+const bfvPair = bfvOps.keygen(filled(4));
+console.log("bfv-public-key", show(api.sha256(bfvPair.publicKey)));
+const relin = bfvOps.relinKeygen(bfvPair.secretKey, filled(5));
+const x = bfvOps.encrypt(bfvPair.publicKey, 20, BigInt64Array.of(1000n, -2000n, 3n), filled(6));
+const y = bfvOps.encrypt(bfvPair.publicKey, 20, BigInt64Array.of(5n, 60n, -7n), filled(7));
+console.log("bfv-ciphertext", show(api.sha256(x.data)));
+console.log("bfv-decrypt", integers(bfvOps.decrypt(bfvPair.secretKey, x)));
+console.log("bfv-add", integers(bfvOps.decrypt(bfvPair.secretKey, bfvOps.add(x, y))));
+const product = bfvOps.multiply(x, y, relin);
+console.log("bfv-multiply", integers(bfvOps.decrypt(bfvPair.secretKey, product)));
+console.log("bfv-budget-left", bfvOps.noiseBudget(bfvPair.secretKey, product) > 1.0);
+console.log("bfv-bad-entropy", errorName(() => bfvOps.keygen(new Uint8Array(32))));
+
+const seed = filled(8);
+const hybrid = pqSignatures.publicKeyFromSeed(seed);
+console.log("pq-public-key", show(api.sha256(hybrid.ed25519)), show(api.sha256(hybrid.mlDsa65)));
+const hybridSignature = pqSignatures.sign(seed, text("ctx"), text("message"), filled(9));
+console.log("pq-signature", show(api.sha256(hybridSignature.ed25519)), show(api.sha256(hybridSignature.mlDsa65)));
+console.log("pq-verify", pqSignatures.verify(hybrid, text("ctx"), text("message"), hybridSignature));
+console.log("pq-verify-wrong-message", pqSignatures.verify(hybrid, text("ctx"), text("other"), hybridSignature));
+console.log("pq-verify-stripped", pqSignatures.verify(hybrid, text("ctx"), text("message"), { ...hybridSignature, mlDsa65: none }));
+console.log("pq-weak-seed", errorName(() => pqSignatures.publicKeyFromSeed(new Uint8Array(32))));

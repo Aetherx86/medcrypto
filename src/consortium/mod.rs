@@ -11,10 +11,13 @@ pub mod core;
 pub mod network;
 pub mod roster;
 
-pub use self::core::{ConsortiumCore, JobResult, Message, Study};
+pub use self::core::{ConsortiumCore, JobResult, Message, Study, StudyScheme};
 pub use consent::{ConsentSource, EvmConsentSource, FileConsentLedger};
-pub use network::{query_status, run_daemon, DaemonHandle};
-pub use roster::{bootstrap_consortium, BootstrapNode, ConsentConfig, NodeConfig, Roster};
+pub use network::{install_post_quantum_tls, query_status, run_daemon, DaemonHandle};
+pub use roster::{
+    bootstrap_consortium, export_node_keys, import_node_keys, BootstrapNode, ConsentConfig,
+    NodeConfig, NodeKeyRecord, Roster,
+};
 
 /// Writes a file readable only by its owner, atomically, so that a crash cannot leave half a key behind.
 pub fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {

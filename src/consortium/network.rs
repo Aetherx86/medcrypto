@@ -2,14 +2,17 @@
 //!
 //! Inbound, a message has to clear three checks before the protocol sees it. The TLS layer checks that the
 //! peer's certificate chains to the consortium's CA. The service checks that the certificate's hash is the
-//! one the roster lists for the claimed sender. And both an Ed25519 and an ML-DSA-65 signature have to cover
+//! one the roster lists for the claimed sender. Its key exchange is hybrid X25519 and ML-KEM-768, so that what is
+//! recorded today stays private from a future quantum computer. And both an Ed25519 and an ML-DSA-65 signature have to cover
 //! this consortium, sender, recipient and payload, so that a recorded message cannot be replayed to a different
 //! node, and so that forging one takes breaking both algorithms.
 
 use super::consent::{ConsentSource, EvmConsentSource, FileConsentLedger};
 use super::core::{ConsortiumCore, Message, NodeStatus};
-use super::roster::{ConsentConfig, NodeConfig, Roster};
-use crate::signatures::{verify, HybridSignature, HybridSigningKey};
+use super::roster::{load_signing_key, ConsentConfig, NodeConfig, Roster};
+use crate::signatures::{
+    verify, verify_ed25519_only, HybridPublicKey, HybridSignature, HybridSigningKey,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -51,7 +54,8 @@ fn signed_bytes(consortium: &str, sender: &str, recipient: &str, payload: &[u8])
 
 const SIGNATURE_CONTEXT: &[u8] = b"medcrypto-consortium-envelope";
 
-/// Both signatures on a message have to hold, for the node that the roster says sent it.
+/// Both signatures on a message have to hold, for the node that the roster says sent it. A node the roster lists
+/// with no ML-DSA key, from before 0.3.0, signs with Ed25519 alone, in the form that version used.
 fn check_envelope(
     roster: &Roster,
     sender: &str,
@@ -62,20 +66,41 @@ fn check_envelope(
         .node(sender)
         .ok_or_else(|| Status::permission_denied("the sender is not in the roster"))?;
     let signed = signed_bytes(&roster.consortium_id, sender, me, &envelope.payload);
-    let signature = HybridSignature {
-        ed25519: envelope.signature.clone(),
-        ml_dsa_65: envelope.pq_signature.clone(),
+    let keys = &node.signing_public_key;
+    let valid = if keys.ml_dsa_65.is_empty() {
+        verify_ed25519_only(&keys.ed25519, &signed, &envelope.signature)
+    } else {
+        let signature = HybridSignature {
+            ed25519: envelope.signature.clone(),
+            ml_dsa_65: envelope.pq_signature.clone(),
+        };
+        verify(keys, SIGNATURE_CONTEXT, &signed, &signature)
     };
-    if verify(
-        &node.signing_public_key,
-        SIGNATURE_CONTEXT,
-        &signed,
-        &signature,
-    ) {
+    if valid {
         Ok(())
     } else {
         Err(Status::unauthenticated("bad signature"))
     }
+}
+
+/// The signature fields for a message from this node, in the form its roster entry calls for.
+fn sign_envelope(
+    key: &HybridSigningKey,
+    listed: &HybridPublicKey,
+    signed: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    if listed.ml_dsa_65.is_empty() {
+        Ok((key.sign_ed25519_only(signed), Vec::new()))
+    } else {
+        let signature = key.sign(SIGNATURE_CONTEXT, signed)?;
+        Ok((signature.ed25519, signature.ml_dsa_65))
+    }
+}
+
+/// TLS key exchange uses hybrid X25519 and ML-KEM-768 first, so that traffic recorded today cannot be decrypted by
+/// a quantum computer later. It falls back only if the peer offers nothing else, and all peers here run this.
+pub fn install_post_quantum_tls() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 struct NodeService {
@@ -270,6 +295,7 @@ fn consent_source(config: &ConsentConfig) -> Result<Box<dyn ConsentSource>, Stri
 
 /// Starts a node. Returns once it is listening, and keeps running until stopped.
 pub async fn run_daemon(config: NodeConfig) -> Result<DaemonHandle, String> {
+    install_post_quantum_tls();
     let roster = Arc::new(Roster::load(&config.roster)?);
     let me = roster
         .node(&config.node_id)
@@ -287,15 +313,8 @@ pub async fn run_daemon(config: NodeConfig) -> Result<DaemonHandle, String> {
         ));
     }
 
-    let seed_text = std::fs::read_to_string(&config.signing_key).map_err(|e| e.to_string())?;
-    let seed: [u8; 32] = hex::decode(seed_text.trim())
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .ok_or("the signing key is not 32 bytes of hex")?;
-    let signing = HybridSigningKey::from_seed(&seed);
-    if signing.public_key() != &me.signing_public_key {
-        return Err("the signing key is not the one the roster lists".to_string());
-    }
+    let signing = load_signing_key(&config, &roster)?;
+    let my_listed_key = me.signing_public_key.clone();
 
     let (events_tx, events_rx) = mpsc::channel::<(String, Message)>();
     let status = Arc::new(Mutex::new(NodeStatus::default()));
@@ -340,23 +359,23 @@ pub async fn run_daemon(config: NodeConfig) -> Result<DaemonHandle, String> {
                             continue;
                         }
                     };
-                    let signature = match signing.sign(
-                        SIGNATURE_CONTEXT,
-                        &signed_bytes(&roster.consortium_id, &me_id, &outgoing.to, &payload),
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("[daemon] {me_id}: could not sign: {e}");
-                            continue;
-                        }
-                    };
+                    let signed =
+                        signed_bytes(&roster.consortium_id, &me_id, &outgoing.to, &payload);
+                    let (signature, pq_signature) =
+                        match sign_envelope(&signing, &my_listed_key, &signed) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("[daemon] {me_id}: could not sign: {e}");
+                                continue;
+                            }
+                        };
                     if let Some(peer) = peers.get(&outgoing.to) {
                         let _ = peer.send(Envelope {
                             sender: me_id.clone(),
                             recipient: outgoing.to.clone(),
                             payload,
-                            signature: signature.ed25519,
-                            pq_signature: signature.ml_dsa_65,
+                            signature,
+                            pq_signature,
                         });
                     }
                 }
@@ -466,6 +485,7 @@ fn decode_base64(text: &str) -> Option<Vec<u8>> {
 
 /// Asks a node how it is doing, as one of the consortium's members.
 pub async fn query_status(config: &NodeConfig, target: &str) -> Result<StatusReply, String> {
+    install_post_quantum_tls();
     let roster = Roster::load(&config.roster)?;
     let node = roster
         .node(target)
@@ -546,6 +566,22 @@ mod tests {
         assert!(
             check_envelope(&roster, "a", "b", &envelope(&key, "other", "b", b"payload")).is_err()
         );
+
+        // A roster entry with an ML-DSA key never accepts Ed25519 alone, so nothing can downgrade it.
+        let raw_ed = key.sign_ed25519_only(&signed_bytes("c", "a", "b", b"payload"));
+        let mut downgraded = good.clone();
+        downgraded.signature = raw_ed.clone();
+        downgraded.pq_signature = Vec::new();
+        assert!(check_envelope(&roster, "a", "b", &downgraded).is_err());
+
+        // A node on an old roster signs and verifies the way that version did.
+        let mut legacy = roster.clone();
+        legacy.nodes[0].signing_public_key.ml_dsa_65 = Vec::new();
+        let mut plain = good.clone();
+        plain.signature = raw_ed;
+        plain.pq_signature = Vec::new();
+        assert!(check_envelope(&legacy, "a", "b", &plain).is_ok());
+        assert!(check_envelope(&legacy, "a", "b", &good).is_err());
 
         // A key that is not the roster's does not count, and neither does a sender who is not in it.
         let stranger = HybridSigningKey::from_seed(&[4; 32]);

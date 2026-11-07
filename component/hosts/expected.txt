@@ -18,3 +18,16 @@ fhe-scalar-mul 241.000 160.000 11.500
 fhe-scalar-half 60.250 40.000 2.875
 fhe-bad-entropy bad-entropy
 fhe-garbage bad-encoding
+bfv-public-key 6aba11ca694d7936974b2e5e240023cd15107d31a5f0964782d70c601ff4a435
+bfv-ciphertext d8ddef3f8f1d4a7c9e8bc7aecc53b498623e5342fc0b703580d8a36d8d0bf3db
+bfv-decrypt 1000 -2000 3
+bfv-add 1005 -1940 -4
+bfv-multiply 5000 -120000 -21
+bfv-budget-left true
+bfv-bad-entropy bad-entropy
+pq-public-key cd25572ac501e629cd003b1eb6bfbf7834fb5e534932075319e556b8b901710f 3e34e786dcb30efbdb962841163327734c82efdb4c8566947e62f1c83f67fd0d
+pq-signature 33a45fa2f1993df77da15301161e92be2b2152072e1f7b71c440363a4c718884 cabc543fee90b563259ead4b7fefa11cbe682765d0247f5cfe6e15b369535b2e
+pq-verify true
+pq-verify-wrong-message false
+pq-verify-stripped false
+pq-weak-seed weak-seed

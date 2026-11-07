@@ -11,7 +11,8 @@ pub mod vertical;
 
 pub use horizontal::RecordEnvelope;
 pub use vertical::{
-    AnalyteStatistics, CohortBatch, CohortFile, EncryptedAggregate, SlotMap, CURRENT_FORMAT,
+    AnalyteStatistics, BfvAggregate, BfvCohortFile, CohortBatch, CohortFile, EncryptedAggregate,
+    SlotMap, BFV_FORMAT, CURRENT_FORMAT,
 };
 
 /// What can go wrong while packing.

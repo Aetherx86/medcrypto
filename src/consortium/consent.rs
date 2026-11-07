@@ -101,6 +101,7 @@ impl EvmConsentSource {
             return Err(format!("{rpc_url}: an RPC endpoint needs https"));
         }
         let agent = ureq::Agent::config_builder()
+            .tls_config(medcrypto_fhir::client::post_quantum_tls())
             .timeout_global(Some(Duration::from_secs(20)))
             .max_redirects(0)
             .build()

@@ -3,7 +3,8 @@
 use medcrypto::consortium::consent::{ConsentEntry, ConsentLedger, StudyEntry};
 use medcrypto::consortium::core::{result_path, ReleasedAnalyte};
 use medcrypto::consortium::{
-    bootstrap_consortium, query_status, run_daemon, BootstrapNode, JobResult, NodeConfig, Study,
+    bootstrap_consortium, export_node_keys, import_node_keys, query_status, run_daemon,
+    BootstrapNode, JobResult, NodeConfig, Study, StudyScheme,
 };
 use medcrypto::fhir::pipeline::{Column, Row};
 use medcrypto::fhir::CohortTable;
@@ -161,6 +162,7 @@ async fn three_hospitals_get_the_right_statistics_with_a_node_down_at_the_end() 
         analytes: vec!["glucose".into(), "hba1c".into()],
         participants: vec!["hospital-a".into(), "hospital-b".into()],
         min_cell_size: 11,
+        scheme: StudyScheme::Ckks,
     };
     write_studies(root, std::slice::from_ref(&study));
     write_ledger(root, &ledger);
@@ -349,6 +351,7 @@ async fn an_outside_certificate_is_refused_and_an_unapproved_study_does_not_star
         analytes: vec!["glucose".into()],
         participants: vec!["node-one".into(), "node-two".into()],
         min_cell_size: 1,
+        scheme: StudyScheme::Ckks,
     };
     write_table(&configs[0], "unapproved", "a", &[Some(100.0)], &[None]);
     let mut ledger = ConsentLedger::default();
@@ -449,6 +452,7 @@ mod protocol_without_a_network {
             analytes: vec!["glucose".into()],
             participants: vec!["node-one".into(), "node-two".into()],
             min_cell_size: 1,
+            scheme: StudyScheme::Ckks,
         };
         let values: Vec<Option<f64>> = (0..5).map(|i| Some(100.0 + i as f64)).collect();
         let nones = vec![None; 5];
@@ -576,4 +580,244 @@ mod protocol_without_a_network {
             .unwrap();
         assert!(b.handle("node-two", own_public.message.clone()).is_err());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bfv_study_gives_exact_statistics_through_the_whole_daemon() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let configs = bootstrap(root, &["hospital-a", "hospital-b", "hospital-c"], 2);
+    let study = Study {
+        id: "exact".into(),
+        epoch: 1,
+        scope: SCOPE.into(),
+        analytes: vec!["glucose".into(), "hba1c".into()],
+        participants: vec!["hospital-a".into(), "hospital-b".into()],
+        min_cell_size: 11,
+        scheme: StudyScheme::Bfv {
+            plain_bits: 50,
+            fixed_point: 10,
+        },
+    };
+    let glucose_a: Vec<Option<f64>> = (0..3000)
+        .map(|i| Some(90.0 + (i % 100) as f64 / 10.0))
+        .collect();
+    let glucose_b: Vec<Option<f64>> = (0..2000)
+        .map(|i| Some(150.5 + (i % 50) as f64 / 10.0))
+        .collect();
+    let hba1c_a: Vec<Option<f64>> = (0..3000)
+        .map(|i| if i < 5 { Some(6.1) } else { None })
+        .collect();
+    let hba1c_b: Vec<Option<f64>> = vec![None; 2000];
+    write_table(&configs[0], "exact", "a", &glucose_a, &hba1c_a);
+    write_table(&configs[1], "exact", "b", &glucose_b, &hba1c_b);
+    let mut ledger = ConsentLedger::default();
+    consents(&mut ledger, "a", 3000);
+    consents(&mut ledger, "b", 2000);
+    ledger.studies.push(StudyEntry {
+        id: "exact".into(),
+        epoch: 1,
+        active: true,
+    });
+    write_ledger(root, &ledger);
+    write_studies(root, std::slice::from_ref(&study));
+
+    let mut handles = Vec::new();
+    for config in &configs {
+        handles.push(run_daemon(config.clone()).await.unwrap());
+    }
+    let job = study.job_id();
+    let results = [
+        wait_for_result(&configs[0], &job).await,
+        wait_for_result(&configs[1], &job).await,
+        wait_for_result(&configs[2], &job).await,
+    ];
+
+    let included: Vec<f64> = glucose_a
+        .iter()
+        .chain(&glucose_b)
+        .flatten()
+        .copied()
+        .collect();
+    let n = included.len() as f64;
+    let mean = included.iter().sum::<f64>() / n;
+    let sum_sq: f64 = included.iter().map(|x| x * x).sum();
+    let sum: f64 = included.iter().sum();
+    for result in &results {
+        assert_eq!(result.aggregate_digest, results[0].aggregate_digest);
+        let glucose = released(result, "glucose");
+        assert_eq!(glucose.count, 5000);
+        // Exact, so that these agree to the limit of the floating point used to compare them.
+        assert!(
+            (glucose.mean - mean).abs() < 1e-9,
+            "{} vs {mean}",
+            glucose.mean
+        );
+        let variance = (sum_sq - sum * sum / n) / (n - 1.0);
+        assert!((glucose.variance.unwrap() - variance).abs() < 1e-6);
+        assert!(result.analytes.iter().any(
+            |a| matches!(a, ReleasedAnalyte::Suppressed { analyte, .. } if analyte == "hba1c")
+        ));
+    }
+    assert_eq!(
+        results[0], results[1],
+        "exact results are identical on every node"
+    );
+    for handle in handles {
+        handle.stop().await.unwrap();
+    }
+}
+
+/// A consortium as version 0.2 made it: Ed25519 keys only, with the seed file holding the Ed25519 seed. It has to
+/// keep working as it is, and then upgrade with no new key generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_old_roster_keeps_working_and_upgrades_without_new_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let configs = bootstrap(root, &["old-a", "old-b"], 2);
+
+    let mut roster: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&configs[0].roster).unwrap()).unwrap();
+    for (node, config) in roster["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(&configs)
+    {
+        let seed: [u8; 32] = [node["party"].as_u64().unwrap() as u8 + 40; 32];
+        std::fs::write(&config.signing_key, hex::encode(seed)).unwrap();
+        let old = medcrypto::signatures::HybridSigningKey::from_legacy_ed25519_seed(&seed);
+        node["signing_public_key"] = hex::encode(&old.public_key().ed25519).into();
+    }
+    std::fs::write(&configs[0].roster, roster.to_string()).unwrap();
+
+    let study = |id: &str| Study {
+        id: id.into(),
+        epoch: 1,
+        scope: SCOPE.into(),
+        analytes: vec!["glucose".into(), "hba1c".into()],
+        participants: vec!["old-a".into(), "old-b".into()],
+        min_cell_size: 1,
+        scheme: StudyScheme::Ckks,
+    };
+    let glucose: Vec<Option<f64>> = (0..20).map(|i| Some(100.0 + i as f64)).collect();
+    let none = vec![None; 20];
+    let mut ledger = ConsentLedger::default();
+    consents(&mut ledger, "a", 20);
+    consents(&mut ledger, "b", 20);
+    ledger.studies.push(StudyEntry {
+        id: "before".into(),
+        epoch: 1,
+        active: true,
+    });
+    ledger.studies.push(StudyEntry {
+        id: "after".into(),
+        epoch: 1,
+        active: true,
+    });
+    write_ledger(root, &ledger);
+    for name in ["before", "after"] {
+        write_table(&configs[0], name, "a", &glucose, &none);
+        write_table(&configs[1], name, "b", &glucose, &none);
+    }
+    write_studies(root, &[study("before")]);
+
+    let one = run_daemon(configs[0].clone()).await.unwrap();
+    let two = run_daemon(configs[1].clone()).await.unwrap();
+    let before = wait_for_result(&configs[0], &study("before").job_id()).await;
+    assert_eq!(released(&before, "glucose").count, 40);
+    one.stop().await.unwrap();
+    two.stop().await.unwrap();
+
+    let shares_before = std::fs::read(configs[0].data_dir.join("threshold-share.bin")).unwrap();
+    let keys_before = std::fs::read(configs[0].data_dir.join("collective-keys.bin")).unwrap();
+
+    // Each node exports its public keys, and the roster gains them.
+    let records: Vec<_> = configs
+        .iter()
+        .map(|c| export_node_keys(c).unwrap())
+        .collect();
+    assert_eq!(records[0].signing_public_key.ml_dsa_65.len(), 1952);
+    assert_eq!(import_node_keys(&configs[0].roster, &records).unwrap(), 2);
+    // A record cannot take over another node's identity.
+    let mut stolen = records[0].clone();
+    stolen.node_id = "old-b".into();
+    assert!(import_node_keys(&configs[0].roster, &[stolen]).is_err());
+
+    write_studies(root, &[study("before"), study("after")]);
+    let one = run_daemon(configs[0].clone()).await.unwrap();
+    let two = run_daemon(configs[1].clone()).await.unwrap();
+    let after = wait_for_result(&configs[0], &study("after").job_id()).await;
+    assert_eq!(released(&after, "glucose").count, 40);
+    assert!(
+        (released(&after, "glucose").mean - released(&before, "glucose").mean).abs() < 0.01,
+        "the same data under the same keys"
+    );
+    one.stop().await.unwrap();
+    two.stop().await.unwrap();
+
+    assert_eq!(
+        shares_before,
+        std::fs::read(configs[0].data_dir.join("threshold-share.bin")).unwrap()
+    );
+    assert_eq!(
+        keys_before,
+        std::fs::read(configs[0].data_dir.join("collective-keys.bin")).unwrap()
+    );
+}
+
+/// A real handshake with a running daemon, by a client that offers nothing but the hybrid group. If the server did
+/// not support it, this would fail, and the connection reports what was negotiated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_daemon_speaks_post_quantum_tls() {
+    use tokio_rustls::rustls::{
+        self,
+        pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let configs = bootstrap(root, &["pq-a", "pq-b"], 2);
+    write_studies(root, &[]);
+    write_ledger(root, &ConsentLedger::default());
+    let handle = run_daemon(configs[0].clone()).await.unwrap();
+
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768];
+    let mut anchors = rustls::RootCertStore::empty();
+    anchors
+        .add(CertificateDer::from_pem_file(&configs[1].ca_cert).unwrap())
+        .unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(provider.into())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(anchors)
+        .with_client_auth_cert(
+            vec![CertificateDer::from_pem_file(&configs[1].cert).unwrap()],
+            PrivateKeyDer::from_pem_file(&configs[1].key).unwrap(),
+        )
+        .unwrap();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client));
+    let mut stream = None;
+    for _ in 0..100 {
+        match tokio::net::TcpStream::connect(&configs[0].listen).await {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let tls = connector
+        .connect(ServerName::try_from("pq-a").unwrap(), stream.unwrap())
+        .await
+        .expect("the daemon has to accept hybrid key exchange");
+    let group = tls
+        .get_ref()
+        .1
+        .negotiated_key_exchange_group()
+        .unwrap()
+        .name();
+    assert_eq!(group, rustls::NamedGroup::X25519MLKEM768);
+    drop(tls);
+    handle.stop().await.unwrap();
 }

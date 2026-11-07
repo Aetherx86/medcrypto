@@ -3,7 +3,7 @@ use crate::clinical_ai::{
     ClinicalVisit, EvaluationMetrics, RelevantVisitSelector, TwoLevelAutoregressivePredictor,
 };
 use crate::compliance::{AuditLedger, KeyManager};
-use crate::fhe::CKKSEngine;
+use crate::fhe::{BfvEngine, CKKSEngine, CkksPreset};
 use crate::models::PatientRecord;
 use crate::quantum::QuantumAuditor;
 use crate::zkp::ZKPEngine;
@@ -44,6 +44,7 @@ pub struct MedCryptoApp {
     secret_key: crate::fhe::SecretKey,
     public_key: crate::fhe::PublicKey,
     current_ciphertext: Option<crate::fhe::Ciphertext>,
+    bfv_status_msg: String,
     encryption_status_msg: String,
 
     // ZKP State
@@ -137,6 +138,7 @@ impl Default for MedCryptoApp {
             secret_key,
             public_key,
             current_ciphertext: None,
+            bfv_status_msg: String::new(),
             encryption_status_msg: "No active ciphertext".to_string(),
 
             zkp_metric_value: 58,
@@ -267,7 +269,10 @@ impl eframe::App for MedCryptoApp {
                 ActiveTab::Overview => self.render_overview(ui),
                 ActiveTab::PatientEncryption => self.render_patient_encryption(ui),
                 ActiveTab::ZeroKnowledgeProofs => self.render_zkp(ui),
-                ActiveTab::FederatedFhe => self.render_federated_fhe(ui),
+                ActiveTab::FederatedFhe => {
+                    self.render_federated_fhe(ui);
+                    self.render_bfv_exact(ui);
+                }
                 ActiveTab::ComplianceShredding => self.render_compliance(ui),
                 ActiveTab::QuantumAudit => self.render_quantum_audit(ui),
                 ActiveTab::ClinicalAi => self.render_clinical_ai(ui),
@@ -557,6 +562,36 @@ impl MedCryptoApp {
                     "Approximation Error: {:.4} (within CKKS noise budget)",
                     (res[0] - expected).abs()
                 ));
+            }
+        });
+    }
+
+    fn render_bfv_exact(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(10.0);
+        ui.group(|ui| {
+            ui.strong("Exact Patient Count with BFV:");
+            ui.label("CKKS is approximate. BFV gives the exact integer, for counts and codes.");
+            if ui
+                .button("Count Patients Across Three Hospitals (BFV)")
+                .clicked()
+            {
+                let outcome = BfvEngine::new(CkksPreset::N8192, 20).and_then(|bfv| {
+                    let (secret, public) = bfv.keygen();
+                    let galois = bfv.sum_galois_keygen(&secret);
+                    let mut total = bfv.encrypt(&public, &vec![1; 300])?;
+                    for count in [500, 200] {
+                        total = bfv.add(&total, &bfv.encrypt(&public, &vec![1; count])?)?;
+                    }
+                    let counted = bfv.sum_all(&total, &galois)?;
+                    Ok(bfv.decrypt(&secret, &counted)?[0])
+                });
+                self.bfv_status_msg = match outcome {
+                    Ok(count) => format!("Exact count: {count} (300 + 500 + 200 patients)"),
+                    Err(e) => format!("Counting failed: {e}"),
+                };
+            }
+            if !self.bfv_status_msg.is_empty() {
+                ui.label(&self.bfv_status_msg);
             }
         });
     }

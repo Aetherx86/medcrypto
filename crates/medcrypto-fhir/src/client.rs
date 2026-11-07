@@ -35,6 +35,16 @@ impl Default for ClientOptions {
     }
 }
 
+/// TLS that offers hybrid X25519 and ML-KEM-768 key exchange first, so that patient data recorded today cannot be
+/// decrypted by a quantum computer later. A server that does not support it falls back to its best classical option.
+pub fn post_quantum_tls() -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder()
+        .unversioned_rustls_crypto_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .build()
+}
+
 /// `(scheme, host and port)` of an absolute URL.
 fn origin(url: &str) -> Option<(String, String)> {
     let (scheme, rest) = url.split_once("://")?;
@@ -94,6 +104,7 @@ pub fn fetch_observations(
 ) -> Result<ParsedBundle, FhirError> {
     let home = check_endpoint(endpoint, options)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(post_quantum_tls())
         .timeout_global(Some(options.timeout))
         // A redirect would carry the token somewhere that has not been checked.
         .max_redirects(0)

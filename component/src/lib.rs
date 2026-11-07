@@ -148,5 +148,109 @@ mod component {
         }
     }
 
+    use self::exports::medcrypto::crypto::bfv_ops::{self, BfvCiphertext, Guest as BfvGuest};
+    use self::exports::medcrypto::crypto::pq_signatures::{
+        self, Guest as PqGuest, HybridPublicKey, HybridSignature,
+    };
+    use crate::core::BfvWire;
+
+    fn bfv_in(c: bfv_ops::BfvCiphertext) -> BfvWire {
+        BfvWire {
+            data: c.data,
+            degree: c.degree,
+            plain_modulus: c.plain_modulus,
+        }
+    }
+
+    fn bfv_out(c: BfvWire) -> BfvCiphertext {
+        BfvCiphertext {
+            data: c.data,
+            degree: c.degree,
+            plain_modulus: c.plain_modulus,
+        }
+    }
+
+    impl BfvGuest for Medcrypto {
+        fn keygen(entropy: Vec<u8>) -> Result<bfv_ops::FheKeypair, bfv_ops::FheError> {
+            let (public_key, secret_key) = core::bfv_keygen(&entropy)?;
+            Ok(FheKeypair {
+                public_key,
+                secret_key,
+            })
+        }
+
+        fn relin_keygen(sk: Vec<u8>, entropy: Vec<u8>) -> Result<Vec<u8>, bfv_ops::FheError> {
+            Ok(core::bfv_relin_keygen(&sk, &entropy)?)
+        }
+
+        fn encrypt(
+            pk: Vec<u8>,
+            plain_bits: u32,
+            values: Vec<i64>,
+            entropy: Vec<u8>,
+        ) -> Result<BfvCiphertext, bfv_ops::FheError> {
+            Ok(bfv_out(core::bfv_encrypt(
+                &pk, plain_bits, &values, &entropy,
+            )?))
+        }
+
+        fn decrypt(sk: Vec<u8>, a: BfvCiphertext) -> Result<Vec<i64>, bfv_ops::FheError> {
+            Ok(core::bfv_decrypt(&sk, &bfv_in(a))?)
+        }
+
+        fn add(a: BfvCiphertext, b: BfvCiphertext) -> Result<BfvCiphertext, bfv_ops::FheError> {
+            Ok(bfv_out(core::bfv_add(&bfv_in(a), &bfv_in(b))?))
+        }
+
+        fn multiply(
+            a: BfvCiphertext,
+            b: BfvCiphertext,
+            relin_key: Vec<u8>,
+        ) -> Result<BfvCiphertext, bfv_ops::FheError> {
+            Ok(bfv_out(core::bfv_multiply(
+                &bfv_in(a),
+                &bfv_in(b),
+                &relin_key,
+            )?))
+        }
+
+        fn noise_budget(sk: Vec<u8>, a: BfvCiphertext) -> Result<f64, bfv_ops::FheError> {
+            Ok(core::bfv_noise_budget(&sk, &bfv_in(a))?)
+        }
+    }
+
+    impl PqGuest for Medcrypto {
+        fn public_key_from_seed(
+            seed: Vec<u8>,
+        ) -> Result<HybridPublicKey, pq_signatures::CryptoError> {
+            let (ed25519, ml_dsa65) = core::hybrid_public_key(&seed)?;
+            Ok(HybridPublicKey { ed25519, ml_dsa65 })
+        }
+
+        fn sign(
+            seed: Vec<u8>,
+            context: Vec<u8>,
+            message: Vec<u8>,
+            entropy: Vec<u8>,
+        ) -> Result<HybridSignature, pq_signatures::CryptoError> {
+            let (ed25519, ml_dsa65) = core::hybrid_sign(&seed, &context, &message, &entropy)?;
+            Ok(HybridSignature { ed25519, ml_dsa65 })
+        }
+
+        fn verify(
+            public_key: HybridPublicKey,
+            context: Vec<u8>,
+            message: Vec<u8>,
+            signature: HybridSignature,
+        ) -> bool {
+            core::hybrid_verify(
+                (&public_key.ed25519, &public_key.ml_dsa65),
+                &context,
+                &message,
+                (&signature.ed25519, &signature.ml_dsa65),
+            )
+        }
+    }
+
     export!(Medcrypto);
 }

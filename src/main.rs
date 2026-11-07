@@ -6,10 +6,12 @@ use comfy_table::{Cell, Color, Table};
 use medcrypto::blockchain::{BlockchainConsentRegistry, EntityRole};
 use medcrypto::compliance::{AuditLedger, KeyManager};
 use medcrypto::consortium::{
-    bootstrap_consortium, query_status, run_daemon, BootstrapNode, NodeConfig,
+    bootstrap_consortium, export_node_keys, import_node_keys, query_status, run_daemon,
+    BootstrapNode, NodeConfig, NodeKeyRecord,
 };
 use medcrypto::fhe::{
-    to_bytes, BfvEngine, CKKSEngine, Ciphertext, CkksPreset, GaloisKey, PublicKey, SecretKey,
+    to_bytes, BfvCiphertext, BfvEngine, CKKSEngine, Ciphertext, CkksPreset, GaloisKey, PublicKey,
+    SecretKey,
 };
 use medcrypto::fhir::client::{fetch_observations, ClientOptions};
 use medcrypto::fhir::pipeline::Row;
@@ -18,14 +20,15 @@ use medcrypto::fhir::{
     Winsorization,
 };
 use medcrypto::models::PatientRecord;
-use medcrypto::packing::vertical::AnalyteStatistics;
-use medcrypto::packing::{CohortFile, RecordEnvelope};
+use medcrypto::packing::vertical::{AnalyteStatistics, BfvCohortFile};
+use medcrypto::packing::{CohortFile, RecordEnvelope, BFV_FORMAT};
 use medcrypto::quantum::QuantumAuditor;
 use medcrypto::signatures::{
     verify as signature_verify, HybridPublicKey, HybridSignature, HybridSigningKey,
 };
 use medcrypto::zkp::{
-    backend_for_profile, Profile, StarkCoprocessorBackend, ThresholdProof, ZKPEngine,
+    backend_for_profile, HashBasedBackend, Profile, ProofChoice, StarkCoprocessorBackend,
+    ThresholdProof, ZKPEngine, ZkPredicateProver,
 };
 use rand::RngCore;
 use std::fs;
@@ -74,8 +77,18 @@ enum ImputeArg {
 enum BackendArg {
     /// The fast range proof, which is not post-quantum
     Pedersen,
+    /// A built-in range proof resting only on SHA-256, which is post-quantum and about 1.4 MB
+    Hash,
     /// An external post-quantum prover
     Stark,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq)]
+enum SchemeArg {
+    /// Approximate real numbers
+    Ckks,
+    /// Exact integers, by a fixed-point factor
+    Bfv,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -152,6 +165,14 @@ enum Commands {
         /// The site's secret for pseudonyms, created if it does not exist
         #[arg(long)]
         pseudonym_key: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = SchemeArg::Ckks)]
+        scheme: SchemeArg,
+        /// For BFV: what values are multiplied by to make integers, so 10 keeps one decimal place
+        #[arg(long, default_value_t = 10)]
+        fixed_point: u64,
+        /// For BFV: the size of the plaintext modulus, which every sum has to stay below
+        #[arg(long, default_value_t = 50)]
+        plain_bits: u32,
     },
 
     /// Fetch from a FHIR R4 server or read a bundle, normalize, and encrypt
@@ -187,6 +208,35 @@ enum Commands {
         /// Allow http:// to a remote server, which sends patient data in the clear
         #[arg(long)]
         allow_insecure_http: bool,
+        #[arg(long, value_enum, default_value_t = SchemeArg::Ckks)]
+        scheme: SchemeArg,
+        /// For BFV: what values are multiplied by to make integers, so 10 keeps one decimal place
+        #[arg(long, default_value_t = 10)]
+        fixed_point: u64,
+        /// For BFV: the size of the plaintext modulus, which every sum has to stay below
+        #[arg(long, default_value_t = 50)]
+        plain_bits: u32,
+    },
+
+    /// Encrypt integers with BFV
+    BfvEncrypt {
+        /// Comma-separated integers
+        #[arg(long, allow_hyphen_values = true)]
+        values: String,
+        #[arg(long)]
+        public_key: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        plain_bits: u32,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Decrypt a BFV ciphertext file exactly, and report the noise budget left
+    BfvDecrypt {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(long)]
+        secret_key: PathBuf,
     },
 
     /// Combine several sites' vertically packed cohorts
@@ -337,6 +387,22 @@ enum Commands {
         poly_degree: usize,
     },
 
+    /// Write this node's public keys, to bring a roster from before 0.3.0 up to date
+    ConsortiumExportKey {
+        #[arg(short, long)]
+        config: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Add exported keys to a roster. Key shares, certificates and identities all stay as they are
+    ConsortiumImportKeys {
+        #[arg(short, long)]
+        roster: PathBuf,
+        #[arg(required = true)]
+        keys: Vec<PathBuf>,
+    },
+
     /// Run or query the consortium aggregation daemon
     Daemon {
         #[command(subcommand)]
@@ -405,6 +471,9 @@ fn main() {
             public_key,
             loinc_filter,
             pseudonym_key,
+            scheme,
+            fixed_point,
+            plain_bits,
         }) => batch_pack(
             &input_dir,
             batch_size,
@@ -412,6 +481,11 @@ fn main() {
             public_key,
             loinc_filter,
             pseudonym_key,
+            SchemeConfig {
+                scheme,
+                fixed_point,
+                plain_bits,
+            },
         ),
         Some(Commands::IngestFhir {
             endpoint,
@@ -426,6 +500,9 @@ fn main() {
             pseudonym_key,
             key_store,
             allow_insecure_http,
+            scheme,
+            fixed_point,
+            plain_bits,
         }) => ingest_fhir(IngestArgs {
             endpoint,
             bundle,
@@ -439,6 +516,11 @@ fn main() {
             pseudonym_key,
             key_store,
             allow_insecure_http,
+            scheme: SchemeConfig {
+                scheme,
+                fixed_point,
+                plain_bits,
+            },
         }),
         Some(Commands::CohortMerge { inputs, output }) => cohort_merge(&inputs, &output),
         Some(Commands::CohortStats {
@@ -521,6 +603,35 @@ fn main() {
             threshold,
             poly_degree,
         }) => consortium_init(&out, &consortium_id, &nodes, threshold, poly_degree),
+        Some(Commands::ConsortiumExportKey { config, output }) => NodeConfig::load(&config)
+            .and_then(|c| export_node_keys(&c))
+            .and_then(|record| {
+                write_json(&output, &record)?;
+                println!(
+                    "[SUCCESS] Public keys of {} written to {}",
+                    record.node_id,
+                    output.display()
+                );
+                Ok(())
+            }),
+        Some(Commands::ConsortiumImportKeys { roster, keys }) => keys
+            .iter()
+            .map(|path| read_json::<NodeKeyRecord>(path))
+            .collect::<Result<Vec<_>, _>>()
+            .and_then(|records| import_node_keys(&roster, &records))
+            .map(|changed| {
+                println!(
+                    "[SUCCESS] {changed} node(s) updated in {}. Give all nodes this roster.",
+                    roster.display()
+                );
+            }),
+        Some(Commands::BfvEncrypt {
+            values,
+            public_key,
+            plain_bits,
+            output,
+        }) => bfv_encrypt(&values, &public_key, plain_bits, &output),
+        Some(Commands::BfvDecrypt { input, secret_key }) => bfv_decrypt(&input, &secret_key),
         Some(Commands::Daemon { action }) => daemon(action),
         Some(Commands::Demo) => {
             run_interactive_demo();
@@ -785,26 +896,54 @@ fn split_codes(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Which homomorphic scheme to pack a cohort with.
+#[derive(Clone, Copy)]
+struct SchemeConfig {
+    scheme: SchemeArg,
+    fixed_point: u64,
+    plain_bits: u32,
+}
+
 fn write_vertical(
     engine: &CKKSEngine,
     key: &PublicKey,
     table: &CohortTable,
     batch_size: usize,
     output: &Path,
+    scheme: SchemeConfig,
 ) -> CliResult {
     println!(
-        "Encrypting {} patients and {} analytes...",
+        "Encrypting {} patients and {} analytes with {}...",
         table.rows.len(),
-        table.columns.len()
+        table.columns.len(),
+        if scheme.scheme == SchemeArg::Bfv {
+            "BFV"
+        } else {
+            "CKKS"
+        }
     );
-    let (cohort, slots) =
-        CohortFile::pack(engine, key, table, batch_size).map_err(|e| e.to_string())?;
-    write_json(output, &cohort)?;
+    let (slots, batches) = match scheme.scheme {
+        SchemeArg::Ckks => {
+            let (cohort, slots) =
+                CohortFile::pack(engine, key, table, batch_size).map_err(|e| e.to_string())?;
+            write_json(output, &cohort)?;
+            let batches = cohort.columns.first().map_or(0, |c| c.batches.len());
+            (slots, batches)
+        }
+        SchemeArg::Bfv => {
+            let bfv = bfv_engine_for(engine.context().param_id(), scheme.plain_bits)?;
+            let (cohort, slots) =
+                BfvCohortFile::pack(&bfv, key, table, batch_size, scheme.fixed_point)
+                    .map_err(|e| e.to_string())?;
+            write_json(output, &cohort)?;
+            let batches = cohort.columns.first().map_or(0, |c| c.batches.len());
+            (slots, batches)
+        }
+    };
     let mut name = output.file_name().unwrap_or_default().to_os_string();
     name.push(".slots");
     let slot_path = output.with_file_name(name);
     write_secret_json(&slot_path, &slots)?;
-    let batches = cohort.columns.first().map_or(0, |c| c.batches.len());
     println!(
         "[SUCCESS] {} batch(es) per analyte written to {}",
         batches,
@@ -815,6 +954,59 @@ fn write_vertical(
         slot_path.display()
     );
     print_quality(table);
+    Ok(())
+}
+
+fn bfv_engine_for(param_id: u64, plain_bits: u32) -> Result<BfvEngine, String> {
+    let preset = [CkksPreset::N8192, CkksPreset::N16384]
+        .into_iter()
+        .find(|p| CKKSEngine::from_preset(*p).context().param_id() == param_id)
+        .ok_or_else(|| format!("no known parameter set has the identifier {param_id}"))?;
+    BfvEngine::new(preset, plain_bits).map_err(|e| e.to_string())
+}
+
+fn bfv_encrypt(values: &str, public_key: &Path, plain_bits: u32, output: &Path) -> CliResult {
+    let key: PublicKey = read_json(public_key)?;
+    let bfv = bfv_engine_for(key.param_id, plain_bits)?;
+    let values = values
+        .split(',')
+        .map(|v| v.trim().parse::<i64>().map_err(|e| format!("{v}: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ciphertext = bfv.encrypt(&key, &values).map_err(|e| e.to_string())?;
+    write_json(output, &ciphertext)?;
+    println!(
+        "[SUCCESS] {} integers encrypted into {}",
+        values.len(),
+        output.display()
+    );
+    println!(
+        "          Results wrap around modulo t = {}.",
+        bfv.plain_modulus()
+    );
+    Ok(())
+}
+
+fn bfv_decrypt(input: &Path, secret_key: &Path) -> CliResult {
+    let ciphertext: BfvCiphertext = read_json(input)?;
+    let secret: SecretKey = read_json(secret_key)?;
+    let bfv = bfv_engine_for(
+        ciphertext.param_id,
+        64 - ciphertext.plain_modulus.leading_zeros(),
+    )?;
+    bfv.validate_ciphertext(&ciphertext)
+        .map_err(|e| format!("{input:?}: {e}"))?;
+    let values = bfv
+        .decrypt(&secret, &ciphertext)
+        .map_err(|e| e.to_string())?;
+    let budget = bfv
+        .noise_budget_bits(&secret, &ciphertext)
+        .map_err(|e| e.to_string())?;
+    let shown: Vec<String> = values.iter().map(i64::to_string).collect();
+    println!("{}", shown.join(", "));
+    eprintln!("Noise budget left: {budget:.0} bits");
+    if budget < 1.0 {
+        return Err("the noise budget has run out, so these values are wrong".to_string());
+    }
     Ok(())
 }
 
@@ -857,6 +1049,7 @@ fn batch_pack(
     public_key: Option<PathBuf>,
     loinc_filter: Option<String>,
     pseudonym: Option<PathBuf>,
+    scheme: SchemeConfig,
 ) -> CliResult {
     let mut records: Vec<PatientRecord> = Vec::new();
     let mut bundles = ParsedBundle::default();
@@ -901,7 +1094,7 @@ fn batch_pack(
         table_from_records(&records)
     };
     let (engine, key) = public_key_or_new(public_key, output)?;
-    write_vertical(&engine, &key, &table, batch_size, output)
+    write_vertical(&engine, &key, &table, batch_size, output, scheme)
 }
 
 struct IngestArgs {
@@ -917,6 +1110,7 @@ struct IngestArgs {
     pseudonym_key: Option<PathBuf>,
     key_store: PathBuf,
     allow_insecure_http: bool,
+    scheme: SchemeConfig,
 }
 
 fn ingest_fhir(args: IngestArgs) -> CliResult {
@@ -976,7 +1170,14 @@ fn ingest_fhir(args: IngestArgs) -> CliResult {
     let (engine, key) = public_key_or_new(args.public_key, &args.output)?;
     match args.mode {
         PackMode::Table => unreachable!("handled above"),
-        PackMode::Vertical => write_vertical(&engine, &key, &table, args.batch_size, &args.output),
+        PackMode::Vertical => write_vertical(
+            &engine,
+            &key,
+            &table,
+            args.batch_size,
+            &args.output,
+            args.scheme,
+        ),
         PackMode::Horizontal => {
             let mut keys = KeyManager::open(&args.key_store)?;
             let features: Vec<String> = table.columns.iter().map(|c| c.analyte.clone()).collect();
@@ -1018,13 +1219,40 @@ fn load_cohort(path: &Path) -> Result<(CKKSEngine, CohortFile), String> {
     Ok((engine, cohort))
 }
 
-fn cohort_merge(inputs: &[PathBuf], output: &Path) -> CliResult {
-    let (_, mut merged) = load_cohort(&inputs[0])?;
-    for path in &inputs[1..] {
-        let (_, next) = load_cohort(path)?;
-        merged = merged.merge(next).map_err(|e| format!("{path:?}: {e}"))?;
+/// Whether a cohort file was packed with BFV, from its format field.
+fn is_bfv_cohort(path: &Path) -> Result<bool, String> {
+    #[derive(serde::Deserialize)]
+    struct Format {
+        format: String,
     }
-    write_json(output, &merged)?;
+    Ok(read_json::<Format>(path)?.format == BFV_FORMAT)
+}
+
+fn load_bfv_cohort(path: &Path) -> Result<(BfvEngine, BfvCohortFile), String> {
+    let cohort: BfvCohortFile = read_json(path)?;
+    let bfv = bfv_engine_for(cohort.param_id, cohort.plain_bits)?;
+    cohort
+        .validate(&bfv)
+        .map_err(|e| format!("{path:?}: {e}"))?;
+    Ok((bfv, cohort))
+}
+
+fn cohort_merge(inputs: &[PathBuf], output: &Path) -> CliResult {
+    if is_bfv_cohort(&inputs[0])? {
+        let (_, mut merged) = load_bfv_cohort(&inputs[0])?;
+        for path in &inputs[1..] {
+            let (_, next) = load_bfv_cohort(path)?;
+            merged = merged.merge(next).map_err(|e| format!("{path:?}: {e}"))?;
+        }
+        write_json(output, &merged)?;
+    } else {
+        let (_, mut merged) = load_cohort(&inputs[0])?;
+        for path in &inputs[1..] {
+            let (_, next) = load_cohort(path)?;
+            merged = merged.merge(next).map_err(|e| format!("{path:?}: {e}"))?;
+        }
+        write_json(output, &merged)?;
+    }
     println!(
         "[SUCCESS] {} cohorts merged into {}",
         inputs.len(),
@@ -1033,7 +1261,56 @@ fn cohort_merge(inputs: &[PathBuf], output: &Path) -> CliResult {
     Ok(())
 }
 
+fn bfv_cohort_stats(input: &Path, keys: &Path, min_cell_size: u64) -> CliResult {
+    let (bfv, cohort) = load_bfv_cohort(input)?;
+    let secret: SecretKey = read_json(&keys.join("secret-key.json"))?;
+    let galois: GaloisKey = read_json(&keys.join("galois-keys.json"))?;
+    println!("Summing slots homomorphically, with exact results...");
+    let aggregates = cohort.aggregate(&bfv, &galois).map_err(|e| e.to_string())?;
+    let mut out = Table::new();
+    out.load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_header(vec!["Analyte", "Unit", "Count", "Mean", "Std. deviation"]);
+    for aggregate in &aggregates {
+        let first = |ct: &BfvCiphertext| -> Result<i64, String> {
+            Ok(bfv.decrypt(&secret, ct).map_err(|e| e.to_string())?[0])
+        };
+        let count = first(&aggregate.count)?;
+        if (count as u64) < min_cell_size {
+            out.add_row(vec![
+                aggregate.column.analyte.clone(),
+                aggregate.column.unit.clone(),
+                format!("fewer than {min_cell_size}"),
+                "withheld".to_string(),
+                "withheld".to_string(),
+            ]);
+            continue;
+        }
+        let stats = AnalyteStatistics::from_exact_totals(
+            &aggregate.column,
+            first(&aggregate.sum)?,
+            first(&aggregate.sum_of_squares)?,
+            count,
+            cohort.fixed_point,
+        );
+        out.add_row(vec![
+            stats.analyte,
+            stats.unit,
+            stats.count.to_string(),
+            format!("{:.3}", stats.mean),
+            stats
+                .standard_deviation
+                .map_or("-".to_string(), |s| format!("{s:.3}")),
+        ]);
+    }
+    println!("{out}");
+    Ok(())
+}
+
 fn cohort_stats(input: &Path, keys: &Path, min_cell_size: u64) -> CliResult {
+    if is_bfv_cohort(input)? {
+        return bfv_cohort_stats(input, keys, min_cell_size);
+    }
     let (engine, cohort) = load_cohort(input)?;
     let secret: SecretKey = read_json(&keys.join("secret-key.json"))?;
     let galois: GaloisKey = read_json(&keys.join("galois-keys.json"))?;
@@ -1096,14 +1373,15 @@ fn proof_backend(
         ProfileArg::Development => Profile::Development,
         ProfileArg::Production => Profile::Production,
     };
-    let stark = match backend {
-        BackendArg::Pedersen => None,
-        BackendArg::Stark => Some(StarkCoprocessorBackend::new(
+    let choice = match backend {
+        BackendArg::Pedersen => ProofChoice::Pedersen,
+        BackendArg::Hash => ProofChoice::HashBased,
+        BackendArg::Stark => ProofChoice::Stark(StarkCoprocessorBackend::new(
             guest_elf.ok_or("the stark backend needs --guest-elf")?,
             runner.ok_or("the stark backend needs --runner")?,
         )),
     };
-    backend_for_profile(profile, stark).map_err(|e| e.to_string())
+    backend_for_profile(profile, choice).map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1436,8 +1714,8 @@ fn step(title: &str) {
 
 fn run_interactive_demo() {
     use medcrypto::fhe::threshold::{
-        aggregate_public, aggregate_secret, combine, partial_decrypt, DkgParty, ThresholdConfig,
-        DEFAULT_SMUDGING_BITS,
+        aggregate_public, aggregate_secret, combine, combine_bfv, partial_decrypt,
+        partial_decrypt_bfv, DkgParty, ThresholdConfig, BFV_SMUDGING_BITS, DEFAULT_SMUDGING_BITS,
     };
     println!(
         "{}",
@@ -1656,23 +1934,35 @@ fn run_interactive_demo() {
         envelope.open(&engine, &keychain).unwrap_err()
     );
 
-    step("[STEP 8] BFV: an exact count, where CKKS would only be approximate");
-    let bfv = BfvEngine::new(CkksPreset::N8192, 20).expect("a valid modulus");
-    let (bfv_secret, bfv_public) = bfv.keygen();
-    let bfv_galois = bfv.sum_galois_keygen(&bfv_secret);
+    step("[STEP 8] BFV: an exact count, under the same collective keys and 2-of-3 decryption");
+    let bfv = BfvEngine::new(CkksPreset::N8192, 50).expect("a valid modulus");
     let flags_a: Vec<i64> = (0..300).map(|i| (i % 3 == 0) as i64).collect();
     let flags_b: Vec<i64> = (0..500).map(|i| (i % 5 == 0) as i64).collect();
-    let site_a = bfv.encrypt(&bfv_public, &flags_a).expect("fits");
-    let site_b = bfv.encrypt(&bfv_public, &flags_b).expect("fits");
+    let site_a = bfv.encrypt(&keys.public_key, &flags_a).expect("fits");
+    let site_b = bfv.encrypt(&keys.public_key, &flags_b).expect("fits");
     let counted = bfv
-        .sum_all(
+        .sum_rows(
             &bfv.add(&site_a, &site_b).expect("same parameters"),
-            &bfv_galois,
+            &keys.galois_key,
         )
         .expect("keys match");
+    let partials: Vec<_> = set
+        .iter()
+        .map(|&p| {
+            partial_decrypt_bfv(
+                &bfv,
+                &shares[p as usize - 1],
+                &counted,
+                &set,
+                BFV_SMUDGING_BITS,
+                &mut rng,
+            )
+            .expect("valid set")
+        })
+        .collect();
     println!(
         "  * Patients meeting a criterion at two sites: {} (the true count is 200)",
-        bfv.decrypt(&bfv_secret, &counted).expect("our key")[0]
+        combine_bfv(&bfv, config, &counted, &partials).expect("valid partials")[0]
     );
 
     step("[STEP 9] Hybrid signature: Ed25519 and ML-DSA-65 together");
@@ -1707,7 +1997,16 @@ fn run_interactive_demo() {
     let report = QuantumAuditor::evaluate_context(engine.context());
     println!("  * {}", report.security_assessment);
     println!("  * Signatures on consortium messages are hybrid, with ML-DSA-65.");
-    println!("  * Pedersen proofs and TLS certificates are not post-quantum. Production proofs need the STARK runner.");
+    let hash_proof = HashBasedBackend
+        .prove_range(59, 0, 65)
+        .expect("5.9 is below 6.5");
+    println!(
+        "  * Range proof resting only on SHA-256: {} KiB, valid: {}",
+        hash_proof.payload.len() / 2048,
+        HashBasedBackend.verify_range(&hash_proof, 0, 65)
+    );
+    println!("  * TLS key exchange is hybrid X25519 and ML-KEM-768.");
+    println!("  * TLS certificates and the Pedersen backend are not post-quantum, so production refuses Pedersen.");
 
     println!(
         "\n{}",

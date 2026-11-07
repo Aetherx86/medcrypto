@@ -326,6 +326,105 @@ fn expected_fhe_lines() -> Vec<String> {
         "fhe-bad-entropy bad-entropy".to_string(),
         "fhe-garbage bad-encoding".to_string(),
     ]
+    .into_iter()
+    .chain(expected_pq_lines())
+    .collect()
+}
+
+/// BFV and the signatures have no floating point in them, so these match exactly on every platform.
+fn expected_pq_lines() -> Vec<String> {
+    let show = |values: &[i64]| {
+        values
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let (public, secret) = bfv_keygen(&[4; 32]).unwrap();
+    let relin = bfv_relin_keygen(&secret, &[5; 32]).unwrap();
+    let a = bfv_encrypt(&public, 20, &[1000, -2000, 3], &[6; 32]).unwrap();
+    let b = bfv_encrypt(&public, 20, &[5, 60, -7], &[7; 32]).unwrap();
+    let product = bfv_multiply(&a, &b, &relin).unwrap();
+    let seed = [8u8; 32];
+    let (ed, ml) = hybrid_public_key(&seed).unwrap();
+    let (sig_ed, sig_ml) = hybrid_sign(&seed, b"ctx", b"message", &[9; 32]).unwrap();
+    vec![
+        format!("bfv-public-key {}", encode(sha256(&public))),
+        format!("bfv-ciphertext {}", encode(sha256(&a.data))),
+        format!("bfv-decrypt {}", show(&bfv_decrypt(&secret, &a).unwrap())),
+        format!(
+            "bfv-add {}",
+            show(&bfv_decrypt(&secret, &bfv_add(&a, &b).unwrap()).unwrap())
+        ),
+        format!(
+            "bfv-multiply {}",
+            show(&bfv_decrypt(&secret, &product).unwrap())
+        ),
+        format!(
+            "bfv-budget-left {}",
+            bfv_noise_budget(&secret, &product).unwrap() > 1.0
+        ),
+        "bfv-bad-entropy bad-entropy".to_string(),
+        format!(
+            "pq-public-key {} {}",
+            encode(sha256(&ed)),
+            encode(sha256(&ml))
+        ),
+        format!(
+            "pq-signature {} {}",
+            encode(sha256(&sig_ed)),
+            encode(sha256(&sig_ml))
+        ),
+        format!(
+            "pq-verify {}",
+            hybrid_verify((&ed, &ml), b"ctx", b"message", (&sig_ed, &sig_ml))
+        ),
+        format!(
+            "pq-verify-wrong-message {}",
+            hybrid_verify((&ed, &ml), b"ctx", b"other", (&sig_ed, &sig_ml))
+        ),
+        format!(
+            "pq-verify-stripped {}",
+            hybrid_verify((&ed, &ml), b"ctx", b"message", (&sig_ed, b""))
+        ),
+        "pq-weak-seed weak-seed".to_string(),
+    ]
+}
+
+#[test]
+fn bfv_and_signatures_refuse_bad_input() {
+    assert_eq!(bfv_keygen(&[0; 32]), Err(FheOpError::BadEntropy));
+    let (public, secret) = bfv_keygen(&[4; 32]).unwrap();
+    assert_eq!(
+        bfv_encrypt(&public, 19, &[1], &[6; 32]),
+        Err(FheOpError::ValueOutOfRange)
+    );
+    assert_eq!(
+        bfv_encrypt(&public, 20, &[1 << 30], &[6; 32]),
+        Err(FheOpError::ValueOutOfRange)
+    );
+    assert_eq!(
+        bfv_encrypt(&[1, 2], 20, &[1], &[6; 32]),
+        Err(FheOpError::BadEncoding)
+    );
+    let a = bfv_encrypt(&public, 20, &[1], &[6; 32]).unwrap();
+    let b = bfv_encrypt(&public, 24, &[1], &[6; 32]).unwrap();
+    assert_eq!(bfv_add(&a, &b), Err(FheOpError::ParameterMismatch));
+    let mut wrong = a.clone();
+    wrong.degree = 2;
+    assert_eq!(bfv_decrypt(&secret, &wrong), Err(FheOpError::BadEncoding));
+    assert_eq!(
+        bfv_multiply(&a, &a, &[1, 2, 3]),
+        Err(FheOpError::BadEncoding)
+    );
+
+    assert_eq!(hybrid_public_key(&[0; 32]), Err(Error::WeakSeed));
+    assert_eq!(hybrid_public_key(&[1; 31]), Err(Error::BadLength));
+    assert_eq!(
+        hybrid_sign(&[1; 32], b"", b"", &[1; 31]),
+        Err(Error::BadLength)
+    );
+    assert!(!hybrid_verify((b"", b""), b"", b"", (b"", b"")));
 }
 
 #[test]

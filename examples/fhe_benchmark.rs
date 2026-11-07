@@ -3,7 +3,7 @@
 
 use medcrypto::fhe::{to_bytes, BfvEngine, CKKSEngine, CkksPreset};
 use medcrypto::signatures::{verify, HybridSigningKey};
-use medcrypto::zkp::{PedersenBackend, ZkPredicateProver};
+use medcrypto::zkp::{HashBasedBackend, PedersenBackend, ZkPredicateProver};
 use std::time::Instant;
 
 fn time<T>(runs: u32, mut f: impl FnMut() -> T) -> f64 {
@@ -146,4 +146,14 @@ fn main() {
             proof.payload.len() / 2
         );
     }
+
+    println!("\n## Range proofs (hash-based backend)\n");
+    let proof = HashBasedBackend.prove_range(58, 0, 65).unwrap();
+    println!("| Prove (ms) | Verify (ms) | Size (bytes) |\n|---:|---:|---:|");
+    println!(
+        "| {:.0} | {:.0} | {} |",
+        time(3, || HashBasedBackend.prove_range(58, 0, 65).unwrap()),
+        time(3, || HashBasedBackend.verify_range(&proof, 0, 65)),
+        proof.payload.len() / 2
+    );
 }

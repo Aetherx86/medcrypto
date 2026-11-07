@@ -4,10 +4,9 @@
 //! because ML-DSA is young: if a flaw turns up in it, or in this implementation of it, forging a signature still
 //! means breaking Ed25519 as well. An attacker has to break both, so dropping one signature gets nowhere.
 
-use ed25519_compact::{KeyPair, Noise, PublicKey as EdPublicKey, Seed, Signature as EdSignature};
+use ed25519_compact::{KeyPair, PublicKey as EdPublicKey, Seed, Signature as EdSignature};
 use fips204::ml_dsa_65;
 use fips204::traits::{KeyGen, SerDes, Signer, Verifier};
-use rand::RngCore;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -89,7 +88,24 @@ fn composite(context: &[u8], message: &[u8]) -> Vec<u8> {
 
 impl HybridSigningKey {
     pub fn from_seed(seed: &[u8; 32]) -> Self {
-        let ed25519 = KeyPair::from_seed(Seed::new(*derive(b"ed25519", seed)));
+        Self::with_ed25519_seed(seed, &derive(b"ed25519", seed))
+    }
+
+    /// For a node key from before 0.3.0, where the seed file held the Ed25519 seed itself. The Ed25519 key stays
+    /// what it was, so that the node keeps its identity, and the ML-DSA key is derived from the same seed.
+    pub fn from_legacy_ed25519_seed(seed: &[u8; 32]) -> Self {
+        Self::with_ed25519_seed(seed, seed)
+    }
+
+    /// Whichever of the two derivations gives this Ed25519 public key. Keys of any version load through this.
+    pub fn matching_ed25519(seed: &[u8; 32], ed25519_public: &[u8]) -> Option<Self> {
+        [Self::from_seed(seed), Self::from_legacy_ed25519_seed(seed)]
+            .into_iter()
+            .find(|k| k.public.ed25519 == ed25519_public)
+    }
+
+    fn with_ed25519_seed(seed: &[u8; 32], ed25519_seed: &[u8; 32]) -> Self {
+        let ed25519 = KeyPair::from_seed(Seed::new(*ed25519_seed));
         let (pq_public, pq_private) = ml_dsa_65::KG::keygen_from_seed(&derive(b"ml-dsa-65", seed));
         let public = HybridPublicKey {
             ed25519: ed25519.pk.to_vec(),
@@ -104,9 +120,11 @@ impl HybridSigningKey {
     }
 
     /// A new key, from the operating system's random source.
+    #[cfg(feature = "os-rng")]
     pub fn generate() -> Self {
+        use rand_core::RngCore;
         let mut seed = Zeroizing::new([0u8; 32]);
-        rand::rngs::OsRng.fill_bytes(seed.as_mut());
+        rand_core::OsRng.fill_bytes(seed.as_mut());
         Self::from_seed(&seed)
     }
 
@@ -118,22 +136,47 @@ impl HybridSigningKey {
         &self.public
     }
 
-    pub fn sign(&self, context: &[u8], message: &[u8]) -> Result<HybridSignature, String> {
+    /// Signs, with `entropy` hedging ML-DSA. It should be fresh, though a repeat does no harm beyond making
+    /// the two signatures identical. Ed25519 here is the deterministic signature of RFC 8032.
+    pub fn sign_with_entropy(
+        &self,
+        context: &[u8],
+        message: &[u8],
+        entropy: &[u8; 32],
+    ) -> Result<HybridSignature, &'static str> {
         let signed = composite(context, message);
-        let mut noise = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut noise);
         Ok(HybridSignature {
-            ed25519: self
-                .ed25519
-                .sk
-                .sign(&signed, Some(Noise::new(noise)))
-                .to_vec(),
+            ed25519: self.ed25519.sk.sign(&signed, None).to_vec(),
             ml_dsa_65: self
                 .ml_dsa_65
-                .try_sign(&signed, b"")
-                .map_err(str::to_string)?
+                .try_sign_with_seed(entropy, &signed, b"")?
                 .to_vec(),
         })
+    }
+
+    #[cfg(feature = "os-rng")]
+    pub fn sign(&self, context: &[u8], message: &[u8]) -> Result<HybridSignature, String> {
+        use rand_core::RngCore;
+        let mut entropy = Zeroizing::new([0u8; 32]);
+        rand_core::OsRng.fill_bytes(entropy.as_mut());
+        self.sign_with_entropy(context, message, &entropy)
+            .map_err(str::to_string)
+    }
+
+    /// An Ed25519 signature alone, for peers still on a roster with no ML-DSA key.
+    pub fn sign_ed25519_only(&self, message: &[u8]) -> Vec<u8> {
+        self.ed25519.sk.sign(message, None).to_vec()
+    }
+}
+
+/// Checks an Ed25519 signature alone, for peers still on a roster with no ML-DSA key.
+pub fn verify_ed25519_only(public: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    match (
+        EdPublicKey::from_slice(public),
+        EdSignature::from_slice(signature),
+    ) {
+        (Ok(key), Ok(sig)) => key.verify(message, &sig).is_ok(),
+        _ => false,
     }
 }
 
@@ -251,6 +294,50 @@ mod tests {
             ml_dsa_65: Vec::new(),
         };
         assert!(!verify(&empty, b"c", b"m", &good));
+    }
+
+    #[test]
+    fn keys_of_every_version_load_and_keep_their_identity() {
+        let seed = [11u8; 32];
+        // Before 0.3.0 the file held the Ed25519 seed itself.
+        let old_public = KeyPair::from_seed(Seed::new(seed)).pk.to_vec();
+        let legacy = HybridSigningKey::matching_ed25519(&seed, &old_public).unwrap();
+        assert_eq!(legacy.public_key().ed25519, old_public);
+        assert_eq!(legacy.public_key().ml_dsa_65.len(), 1952);
+        // In 0.3.0 the Ed25519 seed was derived.
+        let current = HybridSigningKey::from_seed(&seed);
+        let found =
+            HybridSigningKey::matching_ed25519(&seed, &current.public_key().ed25519).unwrap();
+        assert_eq!(found.public_key(), current.public_key());
+        // Nothing else matches, so a wrong key file is noticed.
+        assert!(HybridSigningKey::matching_ed25519(&[12; 32], &old_public).is_none());
+
+        // The legacy path signs both ways.
+        let message = b"message";
+        assert!(verify_ed25519_only(
+            &old_public,
+            message,
+            &legacy.sign_ed25519_only(message)
+        ));
+        assert!(!verify_ed25519_only(
+            &old_public,
+            b"other",
+            &legacy.sign_ed25519_only(message)
+        ));
+        let hybrid = legacy.sign(b"c", message).unwrap();
+        assert!(verify(legacy.public_key(), b"c", message, &hybrid));
+    }
+
+    #[test]
+    fn signing_with_given_entropy_works_without_an_os() {
+        let k = key();
+        let one = k.sign_with_entropy(b"c", b"m", &[1; 32]).unwrap();
+        assert_eq!(one, k.sign_with_entropy(b"c", b"m", &[1; 32]).unwrap());
+        assert_ne!(
+            one.ml_dsa_65,
+            k.sign_with_entropy(b"c", b"m", &[2; 32]).unwrap().ml_dsa_65
+        );
+        assert!(verify(k.public_key(), b"c", b"m", &one));
     }
 
     #[test]

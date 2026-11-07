@@ -5,12 +5,21 @@ members = [".", "component", "crates/*"]
 [profile.dev.package.medcrypto-fhe]
 opt-level = 3
 
+[profile.dev.package.medcrypto-pq]
+opt-level = 3
+
+[profile.dev.package.fips204]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.dev.package.curve25519-dalek]
 opt-level = 3
 
 [package]
 name = "medcrypto"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["Jeong Hoon Kim"]
 description = "Privacy-preserving cross-institutional healthcare data sharing: RNS-CKKS and RNS-BFV, threshold decryption, range proofs, hybrid ML-DSA signatures, FHIR ingestion and a consortium daemon"
@@ -21,15 +30,15 @@ readme = "README.md"
 [dependencies]
 medcrypto-fhe = { path = "crates/medcrypto-fhe" }
 medcrypto-fhir = { path = "crates/medcrypto-fhir" }
-fips204 = { version = "0.5", default-features = false, features = ["default-rng", "ml-dsa-65"] }
+medcrypto-pq = { path = "crates/medcrypto-pq" }
 curve25519-dalek = { version = "4", features = ["digest", "rand_core"] }
-serde_bytes = "0.11"
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 sha3 = "0.10"
 zeroize = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tonic = { version = "0.14", features = ["tls-ring", "transport"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+tonic = { version = "0.14", features = ["tls-aws-lc", "transport"] }
 tonic-prost = "0.14"
 prost = "0.14"
 rcgen = "0.14"
@@ -55,3 +64,4 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tempfile = "3.8"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }

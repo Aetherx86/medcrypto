@@ -23,8 +23,93 @@ pub struct RosterNode {
     pub endpoint: String,
     /// SHA-256 of its certificate, so that the CA alone cannot add a member.
     pub cert_sha256: String,
-    /// Its hybrid message-signing keys, Ed25519 and ML-DSA-65.
+    /// Its hybrid message-signing keys, Ed25519 and ML-DSA-65. A roster from before 0.3.0 holds a plain string
+    /// here, which reads as Ed25519 alone, until `consortium-import-keys` adds the rest.
+    #[serde(deserialize_with = "signing_key_any_version")]
     pub signing_public_key: HybridPublicKey,
+}
+
+fn signing_key_any_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HybridPublicKey, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum AnyVersion {
+        Legacy(String),
+        Hybrid(HybridPublicKey),
+    }
+    Ok(match AnyVersion::deserialize(deserializer)? {
+        AnyVersion::Hybrid(key) => key,
+        AnyVersion::Legacy(text) => HybridPublicKey {
+            ed25519: hex::decode(text).map_err(serde::de::Error::custom)?,
+            ml_dsa_65: Vec::new(),
+        },
+    })
+}
+
+/// One node's public keys, to carry into everybody's roster when upgrading it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NodeKeyRecord {
+    pub node_id: String,
+    pub signing_public_key: HybridPublicKey,
+}
+
+/// What a node's signing seed gives, whichever version created it. The roster says which Ed25519 key it expects.
+pub fn load_signing_key(config: &NodeConfig, roster: &Roster) -> Result<HybridSigningKey, String> {
+    let me = roster
+        .node(&config.node_id)
+        .ok_or_else(|| format!("{} is not in the roster", config.node_id))?;
+    let text = std::fs::read_to_string(&config.signing_key)
+        .map_err(|e| format!("{:?}: {e}", config.signing_key))?;
+    let seed: [u8; 32] = hex::decode(text.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or("the signing key is not 32 bytes of hex")?;
+    let key = HybridSigningKey::matching_ed25519(&seed, &me.signing_public_key.ed25519)
+        .ok_or("the signing key is not the one the roster lists")?;
+    if !me.signing_public_key.ml_dsa_65.is_empty()
+        && me.signing_public_key.ml_dsa_65 != key.public_key().ml_dsa_65
+    {
+        return Err("the signing key is not the one the roster lists".to_string());
+    }
+    Ok(key)
+}
+
+/// A node's public keys, for `consortium-import-keys`. Nothing secret is in this.
+pub fn export_node_keys(config: &NodeConfig) -> Result<NodeKeyRecord, String> {
+    let roster = Roster::load(&config.roster)?;
+    let key = load_signing_key(config, &roster)?;
+    Ok(NodeKeyRecord {
+        node_id: config.node_id.clone(),
+        signing_public_key: key.public_key().clone(),
+    })
+}
+
+/// Adds ML-DSA keys to a roster from before 0.3.0. A node's Ed25519 key cannot change this way, so a record
+/// cannot take over another node's identity. Key shares, certificates and collective keys all stay as they are.
+pub fn import_node_keys(roster_path: &Path, records: &[NodeKeyRecord]) -> Result<usize, String> {
+    let mut roster = Roster::load(roster_path)?;
+    let mut changed = 0;
+    for record in records {
+        let node = roster
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == record.node_id)
+            .ok_or_else(|| format!("{} is not in the roster", record.node_id))?;
+        if node.signing_public_key.ed25519 != record.signing_public_key.ed25519 {
+            return Err(format!(
+                "the Ed25519 key for {} does not match the roster",
+                record.node_id
+            ));
+        }
+        if node.signing_public_key != record.signing_public_key {
+            node.signing_public_key = record.signing_public_key.clone();
+            changed += 1;
+        }
+    }
+    let text = serde_json::to_string_pretty(&roster).map_err(|e| e.to_string())?;
+    write_private_file(roster_path, text.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(changed)
 }
 
 /// The shared description of the consortium. Every node needs the same one.

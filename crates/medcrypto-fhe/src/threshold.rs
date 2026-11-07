@@ -19,6 +19,7 @@
 //! Security model: parties are honest but curious. There is no verifiable secret sharing or proof of correct
 //! partial decryption, so an actively malicious party can cause a wrong result, or deny service.
 
+use crate::bfv::{BfvCiphertext, BfvEngine};
 use crate::ckks::{CKKSEngine, Ciphertext, GaloisKey, KeySwitchKey, PublicKey};
 use crate::ntt::galois_permutation;
 use crate::rns::RnsPoly;
@@ -32,6 +33,10 @@ use std::collections::BTreeMap;
 /// Smudging noise is uniform in `[-2^b, 2^b)`. With a scale of `2^40` and `N = 8192`, 24 bits leaves about
 /// `2^-9` of absolute noise per party in a decoded slot.
 pub const DEFAULT_SMUDGING_BITS: u32 = 24;
+
+/// BFV holds its message in the high bits, far above this noise, so unlike CKKS it can take the most that
+/// [`partial_decrypt_bfv`] allows without losing any precision. The result is still exact.
+pub const BFV_SMUDGING_BITS: u32 = 50;
 
 /// How many parties there are, and how many it takes to decrypt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,6 +414,40 @@ pub fn partial_decrypt<R: RngCore + CryptoRng>(
     if ct.degree() != 1 {
         return Err(FheError::NotRelinearized);
     }
+    partial_on(engine, key, &ct.polys[1], active_set, smudging_bits, rng)
+}
+
+/// The same for a BFV ciphertext, which uses the same keys and the same shares.
+pub fn partial_decrypt_bfv<R: RngCore + CryptoRng>(
+    bfv: &BfvEngine,
+    key: &ThresholdKeyShare,
+    ct: &BfvCiphertext,
+    active_set: &[u32],
+    smudging_bits: u32,
+    rng: &mut R,
+) -> Result<PartialDecryption, FheError> {
+    bfv.validate_ciphertext(ct)?;
+    if ct.degree() != 1 {
+        return Err(FheError::NotRelinearized);
+    }
+    partial_on(
+        bfv.ckks(),
+        key,
+        &ct.polys[1],
+        active_set,
+        smudging_bits,
+        rng,
+    )
+}
+
+fn partial_on<R: RngCore + CryptoRng>(
+    engine: &CKKSEngine,
+    key: &ThresholdKeyShare,
+    c1: &RnsPoly,
+    active_set: &[u32],
+    smudging_bits: u32,
+    rng: &mut R,
+) -> Result<PartialDecryption, FheError> {
     if key.param_id != engine.context().param_id() {
         return Err(FheError::ParameterMismatch);
     }
@@ -422,7 +461,7 @@ pub fn partial_decrypt<R: RngCore + CryptoRng>(
     if !(1..=50).contains(&smudging_bits) {
         return Err(FheError::Threshold("smudging must be 1 to 50 bits".into()));
     }
-    let tables = engine.ciphertext_tables(ct.level());
+    let tables = engine.ciphertext_tables(c1.limb_count() - 1);
     let mut data = RnsPoly::zero(engine.context().poly_degree, tables.len());
     let noise: Vec<i64> = {
         let half = 1i64 << smudging_bits;
@@ -445,7 +484,7 @@ pub fn partial_decrypt<R: RngCore + CryptoRng>(
         }
         let shoup = m.shoup(lambda);
         for i in 0..data.limbs[t].len() {
-            let product = m.mul(ct.polys[1].limbs[t][i], key.share.limbs[t][i]);
+            let product = m.mul(c1.limbs[t][i], key.share.limbs[t][i]);
             data.limbs[t][i] = m.add(m.mul_shoup(product, lambda, shoup), noise.limbs[t][i]);
         }
     }
@@ -456,17 +495,13 @@ pub fn partial_decrypt<R: RngCore + CryptoRng>(
     })
 }
 
-/// All slot values, from `k` partial decryptions by the same set of parties.
-pub fn combine(
+/// `c0` plus all the partial decryptions, after checking that they fit together.
+fn sum_partials(
     engine: &CKKSEngine,
     config: ThresholdConfig,
-    ct: &Ciphertext,
+    c0: &RnsPoly,
     partials: &[PartialDecryption],
-) -> Result<Vec<f64>, FheError> {
-    engine.validate_ciphertext(ct)?;
-    if ct.degree() != 1 {
-        return Err(FheError::NotRelinearized);
-    }
+) -> Result<RnsPoly, FheError> {
     let first = partials
         .first()
         .ok_or_else(|| FheError::Threshold("no partial decryptions".into()))?;
@@ -479,8 +514,8 @@ pub fn combine(
             first.active_set
         )));
     }
-    let tables = engine.ciphertext_tables(ct.level());
-    let mut sum = ct.polys[0].clone();
+    let tables = engine.ciphertext_tables(c0.limb_count() - 1);
+    let mut sum = c0.clone();
     for partial in partials {
         if partial.data.limb_count() != tables.len() {
             return Err(FheError::Malformed(
@@ -495,7 +530,37 @@ pub fn combine(
         }
         engine.add_into(&mut sum, &partial.data, &tables);
     }
+    Ok(sum)
+}
+
+/// All slot values, from `k` partial decryptions by the same set of parties.
+pub fn combine(
+    engine: &CKKSEngine,
+    config: ThresholdConfig,
+    ct: &Ciphertext,
+    partials: &[PartialDecryption],
+) -> Result<Vec<f64>, FheError> {
+    engine.validate_ciphertext(ct)?;
+    if ct.degree() != 1 {
+        return Err(FheError::NotRelinearized);
+    }
+    let sum = sum_partials(engine, config, &ct.polys[0], partials)?;
     let mut values = engine.decode_all(sum, ct.scale);
     values.truncate(ct.num_slots);
     Ok(values)
+}
+
+/// The same for a BFV ciphertext, with exact integers as the result.
+pub fn combine_bfv(
+    bfv: &BfvEngine,
+    config: ThresholdConfig,
+    ct: &BfvCiphertext,
+    partials: &[PartialDecryption],
+) -> Result<Vec<i64>, FheError> {
+    bfv.validate_ciphertext(ct)?;
+    if ct.degree() != 1 {
+        return Err(FheError::NotRelinearized);
+    }
+    let sum = sum_partials(bfv.ckks(), config, &ct.polys[0], partials)?;
+    Ok(bfv.decode_phase_ntt(sum, ct.num_slots))
 }

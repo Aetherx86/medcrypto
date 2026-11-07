@@ -24,8 +24,9 @@ These are what a change must not break, and most have a test that will fail if i
 | :--- | :--- | :--- |
 | `crates/medcrypto-fhe` | RNS-CKKS and threshold decryption | Nothing from this repository |
 | `crates/medcrypto-fhir` | FHIR ingestion | Nothing from this repository |
-| `component` | The Wasm Component | `medcrypto-fhe` without `os-rng` |
-| `.` (`medcrypto`) | Everything else, and the binary | Both crates |
+| `crates/medcrypto-pq` | Hybrid signatures, hash-based range proofs | Nothing from this repository |
+| `component` | The Wasm Component | `medcrypto-fhe` and `medcrypto-pq`, without `os-rng` |
+| `.` (`medcrypto`) | Everything else, and the binary | All three crates |
 
 ## Everyday commands
 
@@ -97,4 +98,5 @@ straight" before adding terms to `evaluate_cubic`.
 
 - The contract test on `anvil` runs only where Foundry is installed. Run it locally when touching `ConsentRegistry.sol` or `consent.rs`.
 - Nothing tests `StarkCoprocessorBackend` against a real prover, and nothing compiles `zk/guest-range`.
+- `commercial/` holds contract templates, and is ignored by Git and Docker on purpose.
 - The GUI is compiled, and never launched.

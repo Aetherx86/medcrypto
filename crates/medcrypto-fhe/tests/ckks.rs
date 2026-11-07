@@ -408,3 +408,43 @@ fn threshold_config_rejects_impossible_values() {
     let mut rng = os_seeded_rng();
     assert!(DkgParty::new(&e, ThresholdConfig::new(3, 2).unwrap(), 4, &mut rng).is_err());
 }
+
+#[test]
+fn threshold_decryption_of_bfv_is_exact_under_the_same_keys() {
+    use medcrypto_fhe::threshold::{combine_bfv, partial_decrypt_bfv, BFV_SMUDGING_BITS};
+    use medcrypto_fhe::BfvEngine;
+    let e = engine();
+    let config = ThresholdConfig::new(3, 2).unwrap();
+    let (keys, shares) = run_dkg(&e, config, &e.sum_rotation_steps());
+    let bfv = BfvEngine::new(CkksPreset::N8192, 50).unwrap();
+    let mut rng = os_seeded_rng();
+
+    let site_a: Vec<i64> = (0..4096).map(|i| 1000 + i % 500).collect();
+    let site_b: Vec<i64> = (0..1000).map(|i| 2000 + i % 300).collect();
+    let total: i64 = site_a.iter().chain(&site_b).sum();
+    let ca = bfv.encrypt(&keys.public_key, &site_a).unwrap();
+    let cb = bfv.encrypt(&keys.public_key, &site_b).unwrap();
+    let sum = bfv
+        .sum_rows(&bfv.add(&ca, &cb).unwrap(), &keys.galois_key)
+        .unwrap();
+
+    for set in [[1u32, 2], [2, 3], [1, 3]] {
+        let partials: Vec<_> = set
+            .iter()
+            .map(|&p| {
+                partial_decrypt_bfv(
+                    &bfv,
+                    &shares[p as usize - 1],
+                    &sum,
+                    &set,
+                    BFV_SMUDGING_BITS,
+                    &mut rng,
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(combine_bfv(&bfv, config, &sum, &partials).unwrap(), [total]);
+    }
+    let one = partial_decrypt_bfv(&bfv, &shares[0], &sum, &[1, 2], 50, &mut rng).unwrap();
+    assert!(combine_bfv(&bfv, config, &sum, &[one]).is_err());
+}

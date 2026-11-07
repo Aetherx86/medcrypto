@@ -14,20 +14,26 @@ use super::consent::ConsentSource;
 use super::roster::Roster;
 use super::write_private_file;
 use crate::compliance::AuditLedger;
-use crate::packing::vertical::{AnalyteStatistics, CohortColumn, CohortFile, EncryptedAggregate};
+use crate::packing::vertical::{
+    AnalyteStatistics, BfvAggregate, BfvCohortFile, CohortColumn, CohortFile, EncryptedAggregate,
+};
 use crate::packing::CURRENT_FORMAT;
 use medcrypto_fhe::ckks::os_seeded_rng;
 use medcrypto_fhe::threshold::{
-    aggregate_public, aggregate_secret, combine, partial_decrypt, CollectiveKeys, DkgParty,
-    DkgPublicShare, DkgSecretShare, PartialDecryption, ThresholdConfig, ThresholdKeyShare,
+    aggregate_public, aggregate_secret, combine, combine_bfv, partial_decrypt, partial_decrypt_bfv,
+    CollectiveKeys, DkgParty, DkgPublicShare, DkgSecretShare, PartialDecryption, ThresholdConfig,
+    ThresholdKeyShare, BFV_SMUDGING_BITS,
 };
-use medcrypto_fhe::{from_bytes, to_bytes, CKKSEngine, Ciphertext, CkksPreset};
+use medcrypto_fhe::{
+    from_bytes, to_bytes, BfvCiphertext, BfvEngine, CKKSEngine, Ciphertext, CkksPreset,
+};
 use medcrypto_fhir::pipeline::{Column, Row};
 use medcrypto_fhir::CohortTable;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// What nodes say to each other.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,6 +54,11 @@ pub enum Message {
         digest: String,
         active_set: Vec<u32>,
         items: Vec<PartialDecryption>,
+    },
+    /// Added last, so that the messages above keep their encoding.
+    ContributionBfv {
+        job: String,
+        cohort: BfvCohortFile,
     },
 }
 
@@ -72,6 +83,23 @@ pub struct Study {
     pub participants: Vec<String>,
     /// Results from fewer patients than this are suppressed.
     pub min_cell_size: u64,
+    /// Which homomorphic scheme to run it on. CKKS, unless a study says otherwise.
+    #[serde(default)]
+    pub scheme: StudyScheme,
+}
+
+/// CKKS gives approximate answers. BFV gives exact ones, on values held to a fixed number of decimals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum StudyScheme {
+    #[default]
+    Ckks,
+    Bfv {
+        /// The size of the plaintext modulus, which every sum has to stay below. 50 bits is the most.
+        plain_bits: u32,
+        /// What values are multiplied by to make integers, so 10 keeps one decimal place.
+        fixed_point: u64,
+    },
 }
 
 impl Study {
@@ -123,12 +151,72 @@ pub struct NodeStatus {
 
 type PartialKey = (Phase, String, Vec<u32>);
 
+/// The encrypted totals, in whichever scheme the study runs on.
+#[derive(Clone)]
+enum Totals {
+    Ckks(Vec<EncryptedAggregate>),
+    Bfv(Vec<BfvAggregate>),
+}
+
+/// One ciphertext to decrypt.
+#[derive(Clone)]
+enum Item {
+    Ckks(Box<Ciphertext>),
+    Bfv(Box<BfvCiphertext>),
+}
+
+impl Totals {
+    fn columns(&self) -> Vec<Column> {
+        match self {
+            Self::Ckks(a) => a.iter().map(|x| x.column.clone()).collect(),
+            Self::Bfv(a) => a.iter().map(|x| x.column.clone()).collect(),
+        }
+    }
+
+    fn counts(&self) -> Vec<Item> {
+        match self {
+            Self::Ckks(a) => a
+                .iter()
+                .map(|x| Item::Ckks(Box::new(x.count.clone())))
+                .collect(),
+            Self::Bfv(a) => a
+                .iter()
+                .map(|x| Item::Bfv(Box::new(x.count.clone())))
+                .collect(),
+        }
+    }
+
+    /// The sum and the sum of squares of one analyte.
+    fn sums_of(&self, index: usize) -> [Item; 2] {
+        match self {
+            Self::Ckks(a) => [
+                Item::Ckks(Box::new(a[index].sum.clone())),
+                Item::Ckks(Box::new(a[index].sum_of_squares.clone())),
+            ],
+            Self::Bfv(a) => [
+                Item::Bfv(Box::new(a[index].sum.clone())),
+                Item::Bfv(Box::new(a[index].sum_of_squares.clone())),
+            ],
+        }
+    }
+
+    fn digest(&self) -> Result<String, String> {
+        let bytes = match self {
+            Self::Ckks(a) => to_bytes(a),
+            Self::Bfv(a) => to_bytes(a),
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(hex::encode(Sha256::digest(bytes)))
+    }
+}
+
 #[derive(Default)]
 struct JobState {
     study: Option<Study>,
     contributed: bool,
     contributions: BTreeMap<String, CohortFile>,
-    aggregate: Option<Vec<EncryptedAggregate>>,
+    bfv_contributions: BTreeMap<String, BfvCohortFile>,
+    aggregate: Option<Totals>,
     digest: Option<String>,
     ready: BTreeMap<u32, String>,
     partials: BTreeMap<PartialKey, BTreeMap<u32, Vec<PartialDecryption>>>,
@@ -155,6 +243,7 @@ pub struct ConsortiumCore {
     jobs: BTreeMap<String, JobState>,
     outbox: Vec<Outgoing>,
     audit: AuditLedger,
+    bfv_engines: BTreeMap<u32, Arc<BfvEngine>>,
 }
 
 impl ConsortiumCore {
@@ -203,6 +292,7 @@ impl ConsortiumCore {
             jobs: BTreeMap::new(),
             outbox: Vec::new(),
             audit,
+            bfv_engines: BTreeMap::new(),
         })
     }
 
@@ -374,6 +464,18 @@ impl ConsortiumCore {
                 self.advance(&job);
                 Ok(())
             }
+            Message::ContributionBfv { job, cohort } => {
+                let bfv = self.bfv_engine(cohort.plain_bits)?;
+                cohort.validate(&bfv).map_err(|e| e.to_string())?;
+                self.jobs
+                    .entry(job.clone())
+                    .or_default()
+                    .bfv_contributions
+                    .entry(sender.to_string())
+                    .or_insert(cohort);
+                self.advance(&job);
+                Ok(())
+            }
             Message::Ready { job, digest } => {
                 self.jobs
                     .entry(job.clone())
@@ -410,6 +512,17 @@ impl ConsortiumCore {
                 Ok(())
             }
         }
+    }
+
+    fn bfv_engine(&mut self, plain_bits: u32) -> Result<Arc<BfvEngine>, String> {
+        if let Some(engine) = self.bfv_engines.get(&plain_bits) {
+            return Ok(engine.clone());
+        }
+        let preset = CkksPreset::from_degree(self.roster.poly_degree)
+            .ok_or_else(|| format!("poly degree {}", self.roster.poly_degree))?;
+        let engine = Arc::new(BfvEngine::new(preset, plain_bits).map_err(|e| e.to_string())?);
+        self.bfv_engines.insert(plain_bits, engine.clone());
+        Ok(engine)
     }
 
     fn load_studies(&self) -> Result<Vec<Study>, String> {
@@ -484,21 +597,42 @@ impl ConsortiumCore {
         if marker.exists() {
             return Err("this node restarted during the job; start a new epoch".to_string());
         }
-        let cohort = self.build_contribution(&study)?;
-        std::fs::write(&marker, b"").map_err(|e| e.to_string())?;
-        let state = self.jobs.get_mut(job).expect("the job exists");
-        state.contributed = true;
-        state.contributions.insert(self.me.clone(), cohort.clone());
-        self.broadcast(Message::Contribution {
-            job: job.to_string(),
-            cohort,
-        });
+        let (columns, rows) = self.consented_rows(&study)?;
+        match study.scheme {
+            StudyScheme::Ckks => {
+                let cohort = self.pack_ckks(columns, rows)?;
+                std::fs::write(&marker, b"").map_err(|e| e.to_string())?;
+                let state = self.jobs.get_mut(job).expect("the job exists");
+                state.contributed = true;
+                state.contributions.insert(self.me.clone(), cohort.clone());
+                self.broadcast(Message::Contribution {
+                    job: job.to_string(),
+                    cohort,
+                });
+            }
+            StudyScheme::Bfv {
+                plain_bits,
+                fixed_point,
+            } => {
+                let cohort = self.pack_bfv(columns, rows, plain_bits, fixed_point)?;
+                std::fs::write(&marker, b"").map_err(|e| e.to_string())?;
+                let state = self.jobs.get_mut(job).expect("the job exists");
+                state.contributed = true;
+                state
+                    .bfv_contributions
+                    .insert(self.me.clone(), cohort.clone());
+                self.broadcast(Message::ContributionBfv {
+                    job: job.to_string(),
+                    cohort,
+                });
+            }
+        }
         self.record_audit(&study, "FHE_COHORT_CONTRIBUTED", job)?;
         Ok(())
     }
 
     /// This node's table, cut down to the study's analytes and to patients whose consent covers it.
-    fn build_contribution(&mut self, study: &Study) -> Result<CohortFile, String> {
+    fn consented_rows(&mut self, study: &Study) -> Result<(Vec<Column>, Vec<Row>), String> {
         let path = self
             .data_dir
             .join("cohorts")
@@ -529,7 +663,11 @@ impl ConsortiumCore {
                 });
             }
         }
-        let columns: Vec<Column> = indices.iter().map(|&i| table.columns[i].clone()).collect();
+        let columns = indices.iter().map(|&i| table.columns[i].clone()).collect();
+        Ok((columns, rows))
+    }
+
+    fn pack_ckks(&mut self, columns: Vec<Column>, rows: Vec<Row>) -> Result<CohortFile, String> {
         if rows.is_empty() {
             // This site still takes part, so that the others do not wait forever, and adds nothing.
             return Ok(CohortFile {
@@ -557,6 +695,34 @@ impl ConsortiumCore {
             &keys.public_key,
             &filtered,
             self.engine.slots(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(cohort)
+    }
+
+    fn pack_bfv(
+        &mut self,
+        columns: Vec<Column>,
+        rows: Vec<Row>,
+        plain_bits: u32,
+        fixed_point: u64,
+    ) -> Result<BfvCohortFile, String> {
+        let bfv = self.bfv_engine(plain_bits)?;
+        if rows.is_empty() {
+            return Ok(BfvCohortFile::empty(&bfv, columns, fixed_point));
+        }
+        let filtered = CohortTable {
+            columns,
+            rows,
+            quality: Vec::new(),
+        };
+        let (keys, _) = self.keys.as_ref().ok_or("no keys yet")?;
+        let (cohort, _) = BfvCohortFile::pack(
+            &bfv,
+            &keys.public_key,
+            &filtered,
+            bfv.slots() / 2,
+            fixed_point,
         )
         .map_err(|e| e.to_string())?;
         Ok(cohort)
@@ -593,12 +759,17 @@ impl ConsortiumCore {
         let Some(study) = state.study.clone() else {
             return Ok(());
         };
-        if state.aggregate.is_none()
-            && study
+        let everyone_in = match study.scheme {
+            StudyScheme::Ckks => study
                 .participants
                 .iter()
-                .all(|p| state.contributions.contains_key(p))
-        {
+                .all(|p| state.contributions.contains_key(p)),
+            StudyScheme::Bfv { .. } => study
+                .participants
+                .iter()
+                .all(|p| state.bfv_contributions.contains_key(p)),
+        };
+        if state.aggregate.is_none() && everyone_in {
             self.compute_aggregate(job, &study)?;
         }
         self.release(job, &study, Phase::Counts)?;
@@ -607,7 +778,31 @@ impl ConsortiumCore {
 
     /// Adds up everybody's cohorts in a fixed order, then announces the hash of the result.
     fn compute_aggregate(&mut self, job: &str, study: &Study) -> Result<(), String> {
+        let totals = match study.scheme {
+            StudyScheme::Ckks => Totals::Ckks(self.aggregate_ckks(job, study)?),
+            StudyScheme::Bfv {
+                plain_bits,
+                fixed_point,
+            } => Totals::Bfv(self.aggregate_bfv(job, study, plain_bits, fixed_point)?),
+        };
+        let digest = totals.digest()?;
         let state = self.jobs.get_mut(job).expect("the job exists");
+        state.aggregate = Some(totals);
+        state.digest = Some(digest.clone());
+        state.ready.insert(self.party, digest.clone());
+        self.broadcast(Message::Ready {
+            job: job.to_string(),
+            digest,
+        });
+        Ok(())
+    }
+
+    fn aggregate_ckks(
+        &mut self,
+        job: &str,
+        study: &Study,
+    ) -> Result<Vec<EncryptedAggregate>, String> {
+        let state = self.jobs.get(job).expect("the job exists");
         let mut merged: Option<CohortFile> = None;
         for participant in &study.participants {
             let cohort = state.contributions[participant].clone();
@@ -624,37 +819,61 @@ impl ConsortiumCore {
         }
         let merged = merged.ok_or("the study has no participants")?;
         let (keys, _) = self.keys.as_ref().ok_or("no keys yet")?;
-        let aggregate = merged
+        merged
             .aggregate(&self.engine, &keys.galois_key)
-            .map_err(|e| e.to_string())?;
-        let digest = hex::encode(Sha256::digest(
-            to_bytes(&aggregate).map_err(|e| e.to_string())?,
-        ));
-        let state = self.jobs.get_mut(job).expect("the job exists");
-        state.aggregate = Some(aggregate);
-        state.digest = Some(digest.clone());
-        state.ready.insert(self.party, digest.clone());
-        self.broadcast(Message::Ready {
-            job: job.to_string(),
-            digest,
-        });
-        Ok(())
+            .map_err(|e| e.to_string())
+    }
+
+    fn aggregate_bfv(
+        &mut self,
+        job: &str,
+        study: &Study,
+        plain_bits: u32,
+        fixed_point: u64,
+    ) -> Result<Vec<BfvAggregate>, String> {
+        let bfv = self.bfv_engine(plain_bits)?;
+        let state = self.jobs.get(job).expect("the job exists");
+        let mut merged: Option<BfvCohortFile> = None;
+        for participant in &study.participants {
+            let cohort = state.bfv_contributions[participant].clone();
+            let names: Vec<&String> = cohort.columns.iter().map(|c| &c.column.analyte).collect();
+            if names != study.analytes.iter().collect::<Vec<_>>() {
+                return Err(format!(
+                    "{participant} sent other analytes than the study's"
+                ));
+            }
+            if cohort.plain_bits != plain_bits || cohort.fixed_point != fixed_point {
+                return Err(format!(
+                    "{participant} used other BFV settings than the study's"
+                ));
+            }
+            merged = Some(match merged {
+                None => cohort,
+                Some(m) => m.merge(cohort).map_err(|e| e.to_string())?,
+            });
+        }
+        let merged = merged.ok_or("the study has no participants")?;
+        let (keys, _) = self.keys.as_ref().ok_or("no keys yet")?;
+        merged
+            .aggregate(&bfv, &keys.galois_key)
+            .map_err(|e| e.to_string())
     }
 
     /// The ciphertexts for a phase, in the order the partial decryptions are in.
-    fn phase_ciphertexts(
-        aggregate: &[EncryptedAggregate],
+    fn phase_items(
+        totals: &Totals,
         counts: Option<&[f64]>,
         min_cell_size: u64,
         phase: Phase,
-    ) -> Vec<Ciphertext> {
+    ) -> Vec<Item> {
         match phase {
-            Phase::Counts => aggregate.iter().map(|a| a.count.clone()).collect(),
-            Phase::Sums => aggregate
+            Phase::Counts => totals.counts(),
+            Phase::Sums => counts
+                .unwrap_or_default()
                 .iter()
-                .zip(counts.unwrap_or_default())
+                .enumerate()
                 .filter(|(_, &count)| count.round() >= min_cell_size as f64)
-                .flat_map(|(a, _)| [a.sum.clone(), a.sum_of_squares.clone()])
+                .flat_map(|(index, _)| totals.sums_of(index))
                 .collect(),
         }
     }
@@ -671,7 +890,7 @@ impl ConsortiumCore {
         if phase == Phase::Counts && state.counts.is_some() {
             return Ok(());
         }
-        let ciphertexts = Self::phase_ciphertexts(
+        let items = Self::phase_items(
             &aggregate,
             state.counts.as_deref(),
             study.min_cell_size,
@@ -687,10 +906,10 @@ impl ConsortiumCore {
             .map(|(&p, _)| p)
             .collect();
         let k = self.config.k as usize;
-        if ready.len() >= k && !ciphertexts.is_empty() {
+        if ready.len() >= k && !items.is_empty() {
             let set: Vec<u32> = ready[..k].to_vec();
             if set.contains(&self.party) && !state.sent.contains(&(phase, set.clone())) {
-                self.publish_partial(job, study, phase, &digest, set, &ciphertexts)?;
+                self.publish_partial(job, study, phase, &digest, set, &items)?;
             }
         }
 
@@ -703,14 +922,14 @@ impl ConsortiumCore {
                 *p == phase && *d == digest && by_party.len() == set.len()
             })
             .map(|(_, by_party)| by_party.clone());
-        if phase == Phase::Sums && ciphertexts.is_empty() {
+        if phase == Phase::Sums && items.is_empty() {
             return self.finish(job, study, &digest, &aggregate, &[]);
         }
         let Some(by_party) = complete else {
             return Ok(());
         };
-        let mut values = Vec::with_capacity(ciphertexts.len());
-        for (index, ct) in ciphertexts.iter().enumerate() {
+        let mut values = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
             let parts = by_party
                 .values()
                 .map(|items| {
@@ -720,9 +939,23 @@ impl ConsortiumCore {
                         .ok_or_else(|| "a partial decryption is missing an item".to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let decrypted =
-                combine(&self.engine, self.config, ct, &parts).map_err(|e| e.to_string())?;
-            values.push(decrypted.first().copied().unwrap_or(0.0));
+            let value = match item {
+                Item::Ckks(ct) => combine(&self.engine, self.config, ct, &parts)
+                    .map_err(|e| e.to_string())?
+                    .first()
+                    .copied()
+                    .unwrap_or(0.0),
+                Item::Bfv(ct) => {
+                    let bits = 64 - ct.plain_modulus.leading_zeros();
+                    let bfv = self.bfv_engine(bits)?;
+                    combine_bfv(&bfv, self.config, ct, &parts)
+                        .map_err(|e| e.to_string())?
+                        .first()
+                        .copied()
+                        .unwrap_or(0) as f64
+                }
+            };
+            values.push(value);
         }
         match phase {
             Phase::Counts => {
@@ -740,28 +973,36 @@ impl ConsortiumCore {
         phase: Phase,
         digest: &str,
         set: Vec<u32>,
-        ciphertexts: &[Ciphertext],
+        items: &[Item],
     ) -> Result<(), String> {
         // The last gate: a study withdrawn after contributions were made does not get decrypted.
         if !matches!(self.consent.study_active(&study.id, study.epoch), Ok(true)) {
             return Err("the study is no longer approved".to_string());
         }
-        let (_, share) = self.keys.as_ref().ok_or("no keys yet")?;
         let mut rng = os_seeded_rng();
-        let items = ciphertexts
-            .iter()
-            .map(|ct| {
-                partial_decrypt(
-                    &self.engine,
-                    share,
-                    ct,
-                    &set,
-                    self.roster.smudging_bits,
-                    &mut rng,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
+        let mut partials = Vec::with_capacity(items.len());
+        for item in items {
+            let partial = match item {
+                Item::Ckks(ct) => {
+                    let (_, share) = self.keys.as_ref().ok_or("no keys yet")?;
+                    partial_decrypt(
+                        &self.engine,
+                        share,
+                        ct,
+                        &set,
+                        self.roster.smudging_bits,
+                        &mut rng,
+                    )
+                }
+                Item::Bfv(ct) => {
+                    let bfv = self.bfv_engine(64 - ct.plain_modulus.leading_zeros())?;
+                    let (_, share) = self.keys.as_ref().ok_or("no keys yet")?;
+                    partial_decrypt_bfv(&bfv, share, ct, &set, BFV_SMUDGING_BITS, &mut rng)
+                }
+            }
             .map_err(|e| e.to_string())?;
+            partials.push(partial);
+        }
         let party = self.party;
         let state = self.jobs.get_mut(job).expect("the job exists");
         state.sent.insert((phase, set.clone()));
@@ -769,13 +1010,13 @@ impl ConsortiumCore {
             .partials
             .entry((phase, digest.to_string(), set.clone()))
             .or_default()
-            .insert(party, items.clone());
+            .insert(party, partials.clone());
         self.broadcast(Message::Partial {
             job: job.to_string(),
             phase,
             digest: digest.to_string(),
             active_set: set,
-            items,
+            items: partials,
         });
         Ok(())
     }
@@ -785,24 +1026,32 @@ impl ConsortiumCore {
         job: &str,
         study: &Study,
         digest: &str,
-        aggregate: &[EncryptedAggregate],
+        aggregate: &Totals,
         values: &[f64],
     ) -> Result<(), String> {
         let state = self.jobs.get(job).expect("the job exists");
         let counts = state.counts.clone().ok_or("no counts yet")?;
+        let factor = match study.scheme {
+            StudyScheme::Ckks => 1.0,
+            StudyScheme::Bfv { fixed_point, .. } => fixed_point as f64,
+        };
         let mut sums = values.as_chunks::<2>().0.iter();
         let analytes = aggregate
+            .columns()
             .iter()
             .zip(&counts)
-            .map(|(a, &count)| {
+            .map(|(column, &count)| {
                 if count.round() >= study.min_cell_size as f64 {
                     let pair = sums.next().expect("one pair per released analyte");
                     ReleasedAnalyte::Released(AnalyteStatistics::from_totals(
-                        &a.column, pair[0], pair[1], count,
+                        column,
+                        pair[0] / factor,
+                        pair[1] / (factor * factor),
+                        count,
                     ))
                 } else {
                     ReleasedAnalyte::Suppressed {
-                        analyte: a.column.analyte.clone(),
+                        analyte: column.analyte.clone(),
                         min_cell_size: study.min_cell_size,
                     }
                 }
@@ -824,6 +1073,7 @@ impl ConsortiumCore {
         state.finished = true;
         // The inputs are of no further use, and they are large.
         state.contributions.clear();
+        state.bfv_contributions.clear();
         state.aggregate = None;
         state.partials.clear();
         Ok(())
