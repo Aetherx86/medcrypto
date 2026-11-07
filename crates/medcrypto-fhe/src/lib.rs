@@ -1,6 +1,7 @@
-//! RNS-CKKS approximate homomorphic encryption, written from scratch in safe Rust.
+//! RNS-CKKS and RNS-BFV homomorphic encryption, written from scratch in safe Rust.
 //!
-//! The scheme works on vectors of real numbers packed into `N/2` slots. Everything is stored in the
+//! CKKS works on vectors of real numbers packed into `N/2` slots, with approximate answers. BFV works on
+//! vectors of integers packed into `N` slots, with exact answers modulo a plaintext modulus. Everything is stored in the
 //! Residue Number System, one 64-bit word per prime per coefficient, so no multi-precision arithmetic
 //! is needed. The modules, from the bottom up:
 //!
@@ -10,10 +11,12 @@
 //! - [`encoder`]: the canonical embedding between slots and polynomial coefficients
 //! - [`ckks`]: keys, encryption, multiplication, relinearization, rescaling and rotation
 //! - [`threshold`]: k-of-n distributed key generation and threshold decryption
+//! - [`bfv`]: RNS-BFV, for exact integer arithmetic, on the same primes and the same keys' machinery
 
 #![forbid(unsafe_code)]
 
 pub mod arith;
+pub mod bfv;
 pub mod ckks;
 pub mod encoder;
 pub mod ntt;
@@ -21,6 +24,7 @@ pub mod params;
 pub mod rns;
 pub mod threshold;
 
+pub use bfv::{BfvCiphertext, BfvEngine};
 pub use ckks::{CKKSContext, CKKSEngine, Ciphertext, GaloisKey, PublicKey, RelinKey, SecretKey};
 pub use params::{CkksParams, CkksPreset, SecurityLevel};
 pub use rns::RnsPoly;

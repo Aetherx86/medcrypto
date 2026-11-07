@@ -2,8 +2,9 @@
 //   cargo run --release --example readme_tour
 
 use medcrypto::compliance::KeyManager;
-use medcrypto::fhe::{CKKSEngine, CkksPreset};
+use medcrypto::fhe::{BfvEngine, CKKSEngine, CkksPreset};
 use medcrypto::packing::RecordEnvelope;
+use medcrypto::signatures::{verify, HybridSigningKey};
 use medcrypto::zkp::{PedersenBackend, ZKPEngine, ZkPredicateProver};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -48,5 +49,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     keys.shred_key(&envelope.envelope.key_id, "patient-1")?;
     assert!(envelope.open(&fhe, &keys).is_err());
     println!("erased: the envelope no longer opens");
+
+    // BFV: exact integers, for counts and anything else that must not be approximate.
+    let bfv = BfvEngine::new(CkksPreset::N8192, 20)?;
+    let (bfv_secret, bfv_public) = bfv.keygen();
+    let bfv_relin = bfv.relin_keygen(&bfv_secret);
+    let x = bfv.encrypt(&bfv_public, &[1000, -2000, 3])?;
+    let y = bfv.encrypt(&bfv_public, &[5, 60, -7])?;
+    let exact = bfv.multiply_relin(&x, &y, &bfv_relin)?;
+    println!("exact: {:?}", bfv.decrypt(&bfv_secret, &exact)?); // [5000, -120000, -21]
+    println!(
+        "noise budget left: {:.0} bits",
+        bfv.noise_budget_bits(&bfv_secret, &exact)?
+    );
+
+    // A hybrid signature: both Ed25519 and ML-DSA-65 have to hold.
+    let signer = HybridSigningKey::generate();
+    let signature = signer.sign(b"release", b"count: 1500")?;
+    assert!(verify(
+        signer.public_key(),
+        b"release",
+        b"count: 1500",
+        &signature
+    ));
+    assert!(!verify(
+        signer.public_key(),
+        b"release",
+        b"count: 1501",
+        &signature
+    ));
     Ok(())
 }

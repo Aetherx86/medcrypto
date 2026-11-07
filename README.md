@@ -28,7 +28,8 @@ and only if the patients consented and enough of them are in the result.
                  count 1500, mean HbA1c 7.106 %, std. dev. 1.370
 ```
 
-Written in Rust, with one WebAssembly Component for Python, TypeScript and Go.
+Written in Rust, with one WebAssembly Component for Python, TypeScript and Go. It has two homomorphic schemes, CKKS for
+approximate real numbers and BFV for exact integers, and it signs what nodes send with both ML-DSA-65 and Ed25519.
 
 > **Status.** This is research software, with a real implementation tested end to end. It is not a certified medical
 > device, and using it does not by itself make anyone compliant with HIPAA or GDPR. Read
@@ -93,9 +94,9 @@ HbA1c is at most 6.5%" can be verified without learning that it is 5.8%.
 **Cryptographic shredding** handles the right to erasure. Each patient's record gets its own key. Destroying that key
 makes every copy of the record unreadable, including backups of the ciphertext and copies on an immutable ledger.
 
-**Post-quantum** means safe against a future large quantum computer. CKKS rests on a lattice problem with no known
-efficient quantum attack. Elliptic curves, which the fast proofs, signatures and TLS certificates use, do not survive
-one. This project is clear about which parts are which: see [Section 16](#16-security-model-and-limitations).
+**Post-quantum** means safe against a future large quantum computer. CKKS and BFV rest on a lattice problem with no known
+efficient quantum attack, and so do ML-DSA signatures. Elliptic curves, which the fast proofs and TLS certificates use, do
+not survive one. This project is clear about which parts are which: see [Section 16](#16-security-model-and-limitations).
 
 ---
 
@@ -104,6 +105,7 @@ one. This project is clear about which parts are which: see [Section 16](#16-sec
 | Capability | How | Where |
 | :--- | :--- | :--- |
 | Encrypted arithmetic on real vectors | RNS-CKKS at `N = 8192` or `16384`, 128 post-quantum bits by the HE Standard's table | [`crates/medcrypto-fhe`](crates/medcrypto-fhe) |
+| Encrypted arithmetic on exact integers | RNS-BFV on the same primes, with batching into `N` slots | [`bfv.rs`](crates/medcrypto-fhe/src/bfv.rs) |
 | Multiplication, relinearization, rescaling | Hybrid key switching with one digit per prime | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) |
 | Slot rotation | Galois keys, applied by permutation in the NTT domain | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) |
 | Clinical scoring on ciphertexts | Linear models, cubic polynomials, a logistic curve | [`ckks.rs`](crates/medcrypto-fhe/src/ckks.rs) |
@@ -112,6 +114,7 @@ one. This project is clear about which parts are which: see [Section 16](#16-sec
 | Per-patient and cohort packing | `RecordEnvelope` and `CohortBatch` | [`src/packing`](src/packing) |
 | Range proofs | Pedersen commitments over ristretto255, swappable for an external prover | [`src/zkp`](src/zkp) |
 | Multi-hospital daemon | gRPC over mutual TLS, signed messages, no central server | [`src/consortium`](src/consortium) |
+| Post-quantum signatures | ML-DSA-65 (FIPS 204) and Ed25519 together, with both required | [`signatures.rs`](src/signatures.rs) |
 | Consent | File ledger, or a smart contract through JSON-RPC | [`consent.rs`](src/consortium/consent.rs), [`ConsentRegistry.sol`](contracts/ConsentRegistry.sol) |
 | Erasure and audit | Per-record keys, destroyed on request, with a hash-chained audit log | [`src/compliance`](src/compliance/mod.rs) |
 | Other languages | One Wasm Component with no imports | [`component`](component) |
@@ -131,10 +134,16 @@ cargo build --release
 ```
 
 Prebuilt archives for Linux x86-64 and macOS ARM are attached to each
-[release](https://github.com/Aetherx86/medcrypto/releases/latest), with checksums and build provenance.
+[release](https://github.com/Aetherx86/medcrypto/releases/latest), with checksums and build provenance. There is also a
+container image, which is the easy way to run a daemon:
 
-**License.** This work is under [CC BY-ND 4.0](LICENSE): it may be shared with attribution, and modified versions may not be
-distributed. The `medcrypto` binary also looks for an Ed25519-signed license token at startup, in `AETHER_LICENSE_KEY` or `~/.aether/license.key`, and exits if there is
+```bash
+docker pull ghcr.io/aetherx86/medcrypto:latest
+docker run --rm -e AETHER_LICENSE_KEY ghcr.io/aetherx86/medcrypto:latest --help
+```
+
+**License.** This work is under [CC BY-NC-ND 4.0](LICENSE): it may be shared with attribution, for non-commercial purposes
+only, and modified versions may not be distributed. The `medcrypto` binary also looks for an Ed25519-signed license token at startup, in `AETHER_LICENSE_KEY` or `~/.aether/license.key`, and exits if there is
 none.
 
 To see the whole flow on synthetic data first:
@@ -521,6 +530,58 @@ Level 0:  add all three, and add the constant 1 at scale t
 - Noise grows along with the value in repeated squaring, so relative error is the measure to use there. Seven squarings
   of 1.1 at `N16384` come out with a relative error of about `10^-6`.
 
+### BFV: exact integers
+
+CKKS answers approximately, which suits lab values. BFV answers exactly, which suits counts, codes and anything where 1234 must
+not come back as 1234.00002. [`BfvEngine`](crates/medcrypto-fhe/src/bfv.rs) runs on the same ring, primes, NTT and key switching,
+so the same line of the standard's table applies.
+
+| | CKKS | BFV |
+| :--- | :--- | :--- |
+| Values | Real numbers | Integers in `(-t/2, t/2]` |
+| Answers | Approximate, about five decimal places | Exact, modulo `t` |
+| Slots | `N/2` | `N`, as two rows of `N/2` |
+| Multiplication limit | Levels, spent by rescaling | A noise budget, with no rescaling |
+| What goes wrong at the limit | Refused, as out of levels | Silently wrong answers, so watch `noise_budget_bits` |
+| What goes wrong on overflow | Refused at encoding | Wraps around modulo `t`, so choose `t` above any result |
+| Used by the daemon | Yes | No: library only for now |
+
+```rust
+let bfv = BfvEngine::new(CkksPreset::N8192, 20)?;      // A 20-bit plaintext modulus.
+let (secret, public) = bfv.keygen();
+let relin = bfv.relin_keygen(&secret);
+let x = bfv.encrypt(&public, &[1000, -2000, 3])?;
+let y = bfv.encrypt(&public, &[5, 60, -7])?;
+let product = bfv.multiply_relin(&x, &y, &relin)?;
+assert_eq!(bfv.decrypt(&secret, &product)?, [5000, -120000, -21]);
+```
+
+**Noise budget.** Each multiplication uses up budget, and the choice of `t` trades against it: a larger `t` wraps around later and
+leaves less room. These are measured, by the `measure_budgets` test, as the bits left after each multiplication of a chain. Below
+1 bit, decryption is wrong.
+
+| Preset | `t` | Fresh | After multiplications 1, 2, 3, ... | Multiplications that work |
+| :--- | ---: | ---: | :--- | ---: |
+| `N8192` | 20 bits | 101 | 68, 36, 3 | 3 |
+| `N8192` | 30 bits | 80 | 37 | 1 |
+| `N8192` | 40 bits | 60 | 6 | 1 |
+| `N16384` | 20 bits | 301 | 268, 235, 202, 169, 135, 102, 68, 34 | 8 |
+| `N16384` | 30 bits | 283 | 239, 196, 153, 109, 65, 21 | 6 |
+| `N16384` | 40 bits | 261 | 207, 154, 100, 47 | 4 |
+
+`t` has to be a prime that is 1 mod `2N`, and few of those are small: at `N16384`, the largest 20-bit one is 786433.
+
+**Exact scaling.** A BFV multiplication needs `round(t * x / Q)` for an `x` larger than `Q` can hold. The usual RNS methods
+approximate this in floating point. Here it is exact, in word arithmetic only. Each polynomial is lifted from `Q` to an auxiliary
+basis `B` through balanced mixed-radix digits, and multiplied in `Q * B`. Then `y = t * x + floor(Q / 2)` is split as `Q * z + r`. The
+residues of `y` modulo `Q` are exactly those of `r`, so `r` can be lifted to `B`, and `z = (y - r) / Q` is a plain division in each
+prime of `B`. It costs more than the approximate methods: a multiplication takes 12 ms at `N = 8192`, against 0.14 ms for CKKS.
+
+**Operations.** `add`, `sub`, `negate`, `add_plain`, `multiply_plain`, `multiply`, `relinearize`, `multiply_relin`, `rotate_rows`,
+`swap_rows`, `sum_all` and `noise_budget_bits`. `sum_all` gives every slot the total of all `N`, using keys from `sum_galois_keygen`.
+
+Use separate keys for BFV and CKKS, even though the key types are the same.
+
 ### What the API differs on from the roadmap's sketch
 
 The roadmap proposed `rotate`, `relinearize` and `rescale_to_next` returning plain values. Here they return `Result`, so that
@@ -751,12 +812,34 @@ Messages may arrive in any order. A partial decryption that arrives before its a
 1. **TLS.** The peer's certificate has to chain to the consortium's CA, on both sides of the connection.
 2. **Roster.** The certificate's SHA-256 has to be the one the roster lists for the claimed sender, so even the CA cannot add a
    member without changing every node's roster.
-3. **Signature.** An Ed25519 signature has to cover the consortium, sender, recipient and payload hash, so a recorded message
-   cannot be replayed to another node or another consortium.
+3. **Signatures.** Both an Ed25519 and an ML-DSA-65 signature have to cover the consortium, sender, recipient and payload hash, so
+   a recorded message cannot be replayed to another node or another consortium.
 4. **Protocol.** A share or partial decryption has to be from the party it claims. Ciphertexts are fully validated, including
    that every residue is below its prime, before anything uses them.
 
 The gRPC service is defined in [`proto/consortium.proto`](proto/consortium.proto), and compiles with no `protoc`.
+
+### Hybrid signatures
+
+[`signatures.rs`](src/signatures.rs) signs each message with both Ed25519 and ML-DSA-65 (FIPS 204), and verification needs both.
+
+- ML-DSA is what holds against a quantum computer, since Ed25519 falls to Shor's algorithm.
+- Ed25519 stays because ML-DSA is young. If a flaw turns up in it, or in this implementation, a forgery still means breaking
+  Ed25519 too. Removing or replacing either half of a signature makes it invalid.
+- One 32-byte seed makes both keys, through separate derivations, and a context string is bound into what gets signed.
+
+ML-DSA comes from the [`fips204`](https://crates.io/crates/fips204) crate, whose key generation a test checks against NIST's ACVP
+vector. A signature is 64 + 3309 bytes, and a public key is 32 + 1952. Signing takes 0.24 ms and verifying 0.10 ms, so this adds
+little to any message here.
+
+The same signatures work on files:
+
+```bash
+M=./target/release/medcrypto
+$M sign-keygen --output-dir sign
+$M sign --key sign/signing-key.hex --input results.json --output results.sig
+$M verify-signature --public-key sign/signing-public.json --input results.json --signature results.sig
+```
 
 ### Privacy checks
 
@@ -897,7 +980,7 @@ interface fhe-ops {
 }
 ```
 
-This runs at `N = 8192`. It differs from the roadmap's sketch in three ways, on purpose: `encrypt-vector` takes `entropy`, because
+This runs CKKS at `N = 8192`, and BFV and hybrid signatures are not in the component yet. It differs from the roadmap's sketch in three ways, on purpose: `encrypt-vector` takes `entropy`, because
 this component has no random source; functions return `result`, because input can be bad; and `keygen` and `decrypt-vector` are
 added, since nothing could be used otherwise.
 
@@ -961,8 +1044,9 @@ From [`examples/readme_tour.rs`](examples/readme_tour.rs), which CI compiles:
 
 ```rust
 use medcrypto::compliance::KeyManager;
-use medcrypto::fhe::{CKKSEngine, CkksPreset};
+use medcrypto::fhe::{BfvEngine, CKKSEngine, CkksPreset};
 use medcrypto::packing::RecordEnvelope;
+use medcrypto::signatures::{verify, HybridSigningKey};
 use medcrypto::zkp::{PedersenBackend, ZKPEngine, ZkPredicateProver};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1005,6 +1089,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(envelope.open(&fhe, &keys).is_ok());
     keys.shred_key(&envelope.envelope.key_id, "patient-1")?;
     assert!(envelope.open(&fhe, &keys).is_err());
+
+    // BFV: exact integers, for counts and anything else that must not be approximate.
+    let bfv = BfvEngine::new(CkksPreset::N8192, 20)?;
+    let (bfv_secret, bfv_public) = bfv.keygen();
+    let bfv_relin = bfv.relin_keygen(&bfv_secret);
+    let x = bfv.encrypt(&bfv_public, &[1000, -2000, 3])?;
+    let y = bfv.encrypt(&bfv_public, &[5, 60, -7])?;
+    let exact = bfv.multiply_relin(&x, &y, &bfv_relin)?;
+    println!("exact: {:?}", bfv.decrypt(&bfv_secret, &exact)?); // [5000, -120000, -21]
+
+    // A hybrid signature: both Ed25519 and ML-DSA-65 have to hold.
+    let signer = HybridSigningKey::generate();
+    let signature = signer.sign(b"release", b"count: 1500")?;
+    assert!(verify(signer.public_key(), b"release", b"count: 1500", &signature));
+    assert!(!verify(signer.public_key(), b"release", b"count: 1501", &signature));
     Ok(())
 }
 ```
@@ -1049,14 +1148,14 @@ Secret keys and shares wipe their memory when dropped, and print no key material
 
 | Part | Rests on | Against a quantum computer |
 | :--- | :--- | :--- |
-| CKKS at the presets | RLWE, 128 bits by the standard's table | No efficient attack known |
+| CKKS and BFV at the presets | RLWE, 128 bits by the standard's table | No efficient attack known |
+| Consortium message signatures | ML-DSA-65 and Ed25519, both required | Holds as long as ML-DSA does |
 | SHA-256 chains, AES-256-GCM | Symmetric | About 128 bits under Grover |
 | Pedersen proofs | Discrete logarithm on an elliptic curve | **Broken** |
-| Ed25519 message signatures | Elliptic curve | **Broken** |
 | TLS certificates and key exchange | Whatever `rustls` negotiates, with elliptic-curve certificates | **Certificates broken.** Traffic recorded now may be decrypted later |
 | Consent contract | Ethereum's own signatures | **Broken**, for that chain |
 
-So the claim is narrow: the data's homomorphic encryption is post-quantum. **The system as a whole is not.** Ciphertexts recorded from the
+So the homomorphic encryption and the message signatures are post-quantum. **TLS and the Pedersen proofs are not.** Ciphertexts recorded from the
 network remain protected by their CKKS layer, though secret shares sent during key generation rely on TLS alone, which matters if an
 attacker records that traffic today and has a quantum computer later.
 
@@ -1112,6 +1211,22 @@ will differ, so run it.
 | Relinearization key | 1.5 MiB | 18 MiB |
 | Rotation keys for `sum_slots` | 18 MiB | 234 MiB |
 
+| BFV, 20-bit `t` | `N = 8192` (ms) | `N = 16384` (ms) |
+| :--- | ---: | ---: |
+| Encrypt, all slots | 1.15 | 5.38 |
+| Decrypt | 2.59 | 21.68 |
+| Add | 0.01 | 0.07 |
+| Multiply by plaintext | 0.29 | 1.42 |
+| Multiply | 12.33 | 103.74 |
+| Relinearize | 1.56 | 15.75 |
+| Sum all slots | 20.65 | 222.42 |
+
+| Hybrid signature | Time (ms) | Size |
+| :--- | ---: | ---: |
+| Key generation | 0.13 | Public key 1984 bytes |
+| Sign | 0.24 | Signature 3373 bytes |
+| Verify | 0.10 | |
+
 | Range proof (Pedersen) | Prove (ms) | Verify (ms) | Size |
 | :--- | ---: | ---: | ---: |
 | `[0, 65]` | 2.04 | 1.91 | 2.2 KiB |
@@ -1124,7 +1239,7 @@ other node, and each node sends its share of the rotation keys during key genera
 
 ## 19. Command reference
 
-Run any of these with `--help` for all of its options.
+BFV has no command of its own yet, and it runs in `demo` and from the library. Run any of these with `--help` for all of its options.
 
 | Command | What it does |
 | :--- | :--- |
@@ -1142,6 +1257,8 @@ Run any of these with `--help` for all of its options.
 | `open-record` | Opens and decrypts an envelope, if its key exists |
 | `shred` | Destroys a record's key |
 | `prove`, `verify` | Range proofs with either backend |
+| `sign-keygen` | Writes a hybrid Ed25519 and ML-DSA-65 signing key |
+| `sign`, `verify-signature` | Signs a file and checks it, with both algorithms |
 | `quantum-audit` | Checks parameters against the HE Standard |
 | `consortium-init` | Creates a CA, certificates, keys, a roster and node configurations |
 | `daemon run` | Runs a node until interrupted |
@@ -1262,7 +1379,7 @@ meant for demonstrations. The daemon, the FHIR pipeline and threshold decryption
 ```
 medcrypto/
 ├── crates/
-│   ├── medcrypto-fhe/        RNS-CKKS and threshold decryption. No OS dependency without os-rng
+│   ├── medcrypto-fhe/        RNS-CKKS, RNS-BFV and threshold decryption. No OS dependency without os-rng
 │   └── medcrypto-fhir/       FHIR parsing, terminology, cleaning, HTTP client
 ├── src/
 │   ├── main.rs               The command line
@@ -1270,6 +1387,7 @@ medcrypto/
 │   ├── zkp/                  ZkPredicateProver, Pedersen range proofs, the STARK adapter
 │   ├── consortium/           Roster, consent sources, protocol state machine, gRPC and TLS
 │   ├── compliance/           Key store, shredding, audit chain
+│   ├── signatures.rs         Hybrid ML-DSA-65 and Ed25519 signatures
 │   ├── quantum/              The check against the HE Standard
 │   ├── blockchain/           DID and consent simulator, EVM calldata
 │   ├── clinical_ai/          The medication recommender sample
@@ -1305,10 +1423,12 @@ The cryptographic crates are built with optimization even in debug mode, so the 
 | Parameters | `params.rs` | Presets fit the table. The old toy parameters and overlong chains are refused |
 | CKKS | `crates/medcrypto-fhe/tests/ckks.rs` | Each operation against plaintext, at both presets. Bad input gives an error and not a panic |
 | Threshold | same file | Any `k` of `n` decrypts. Fewer or mixed sets do not. A forged share gives garbage |
+| BFV | `crates/medcrypto-fhe/tests/bfv.rs` | Exact results at both presets, including negatives, wrap-around and multiplying until the budget runs out. Rotation and row swap |
 | FHIR | `crates/medcrypto-fhir/tests` | Parsing, conversion, cleaning, and the client against a real socket, including a hostile `next` link |
 | Packing | `tests/packing_test.rs` | Statistics match plaintext, missing values are excluded, erasure holds across processes |
 | Range proofs | `tests/zkp_range_test.rs` | Honest proofs verify. Tampering and moved commitments fail. Production refuses Pedersen. The runner rules hold |
 | Daemon | `tests/consortium_test.rs` | Three real nodes over mutual TLS get the right statistics, with consent and cell suppression applied, one node down, and restart from disk. An outside certificate is refused. A study withdrawn midway is not decrypted |
+| Signatures | `src/signatures.rs`, `src/consortium/network.rs` | Key generation matches NIST's vector. Both halves are required. A message with either missing, or replayed elsewhere, is refused |
 | Consent | `tests/evm_consent_test.rs` | ABI encoding, failing closed, and the contract on a real local chain when Foundry is present |
 | Command line | `tests/cli_test.rs` | The documented commands, through the real binary |
 | Wasm | `component/tests/vectors.rs` | Published vectors, and that the expected host output is right |
@@ -1318,7 +1438,7 @@ The cryptographic crates are built with optimization even in debug mode, so the 
 | Workflow | Trigger | What it does |
 | :--- | :--- | :--- |
 | [`ci.yml`](.github/workflows/ci.yml) | Push, PR | Secret scan, repository guard, conflict markers, no emoji in docs. Then on Ubuntu and macOS: format, clippy with warnings denied, tests, `cargo audit`, strict docs, a demo run |
-| [`component.yml`](.github/workflows/component.yml) | Push, PR, tag | Builds the Wasm, checks it imports nothing, runs it from Python, TypeScript and Go on Ubuntu and macOS. On a tag: command line archives, build provenance, and a release |
+| [`component.yml`](.github/workflows/component.yml) | Push, PR, tag | Builds the Wasm, checks it imports nothing, runs it from Python, TypeScript and Go on Ubuntu and macOS. On a tag: command line archives, build provenance, a release, and a container image on GHCR |
 | [`audit.yml`](.github/workflows/audit.yml) | Push, PR, weekly | Dependency advisories |
 
 All actions are pinned to commits. The repository guard looks for what supply chain attacks hide in: invisible Unicode, things that run
@@ -1344,9 +1464,11 @@ Versioning: a fix increments `0.0.X`, and new functionality or platform support 
 | Consent from a smart contract | Done | Tested on a local chain only |
 | k-of-n key generation and threshold decryption | Done | No verifiable secret sharing |
 | Wasm `fhe-ops` | Done | Python, TypeScript and Go |
+| RNS-BFV | Done | Library and demo. Not yet in the daemon, the command line or Wasm |
+| Hybrid ML-DSA-65 and Ed25519 signatures | Done | On all daemon messages and for files |
 
 Worth doing next, roughly in order of value: verifiable secret sharing and proofs of correct partial decryption; input range proofs for
-contributions; differential privacy on released statistics; post-quantum TLS and signatures; a real SP1 runner; key store integration
+contributions; differential privacy on released statistics; post-quantum TLS; BFV in the daemon; a real SP1 runner; key store integration
 with an HSM or KMS; and resharing for changing membership.
 
 ---
@@ -1377,6 +1499,9 @@ with an HSM or KMS; and resharing for changing membership.
 | Term | Meaning |
 | :--- | :--- |
 | CKKS | A homomorphic encryption scheme for approximate arithmetic on real numbers |
+| BFV | A homomorphic encryption scheme for exact arithmetic on integers modulo `t` |
+| Noise budget | How much more noise a BFV ciphertext can take before it decrypts wrongly |
+| ML-DSA | A lattice-based signature scheme standardized as FIPS 204, formerly Dilithium |
 | RNS | Residue Number System: storing a big number as its residues modulo several small primes |
 | RLWE | Ring Learning With Errors, the lattice problem CKKS's security rests on |
 | `N` | The polynomial ring's degree. Larger is more secure and slower |
@@ -1405,5 +1530,5 @@ with an HSM or KMS; and resharing for changing membership.
 
 ## 27. License
 
-[Creative Commons Attribution-NoDerivatives 4.0 International (CC BY-ND 4.0)](https://creativecommons.org/licenses/by-nd/4.0/).
+[Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International (CC BY-NC-ND 4.0)](https://creativecommons.org/licenses/by-nc-nd/4.0/).
 Copyright (c) 2026 Jeong Hoon Kim. See [LICENSE](LICENSE) and [LEGAL.md](LEGAL.md).

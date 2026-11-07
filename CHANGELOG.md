@@ -3,6 +3,39 @@
 Versions follow this rule: a bug or security fix increments `0.0.X`, and new functionality or new platform
 support increments `0.X.0`.
 
+## 0.3.0
+
+Adds a second homomorphic scheme and post-quantum signatures. English first, then Korean.
+
+| Area | Before (0.2.2) | After (0.3.0) |
+| :--- | :--- | :--- |
+| Homomorphic schemes | CKKS, approximate real numbers | CKKS and RNS-BFV, which gives exact integers modulo `t` in `N` slots |
+| BFV multiplication | Not available | Exact scaling in word arithmetic only, through an auxiliary basis |
+| Signatures on daemon messages | Ed25519 | Ed25519 and ML-DSA-65 (FIPS 204), with both required |
+| Roster | One Ed25519 key per node | Both public keys per node. Consortiums made with an older version have to be created again |
+| `signing.key` | Ed25519 seed | A seed that both keys derive from |
+| Signing files | Not available | `sign-keygen`, `sign`, `verify-signature` |
+| Packages | Release files only | Also a container image, `ghcr.io/aetherx86/medcrypto` |
+| License | CC BY-ND 4.0 | CC BY-NC-ND 4.0 |
+
+BFV is in the library and the demo, and is not yet in the daemon, the command line or the Wasm Component. TLS and the Pedersen
+backend are still not post-quantum. `noise_budget_bits` reports how much room a BFV ciphertext has left, and answers go wrong below
+1 bit.
+
+| 영역 | 이전 (0.2.2) | 이후 (0.3.0) |
+| :--- | :--- | :--- |
+| 동형암호 방식 | CKKS, 근사 실수 | CKKS와 RNS-BFV. BFV는 `N`개 슬롯에서 `t`를 법으로 정확한 정수를 제공 |
+| BFV 곱셈 | 없음 | 보조 기저를 통해 워드 연산만으로 정확히 스케일링 |
+| 데몬 메시지 서명 | Ed25519 | Ed25519와 ML-DSA-65(FIPS 204), 둘 다 필요 |
+| 로스터 | 노드당 Ed25519 키 1개 | 노드당 공개키 2개. 이전 버전으로 만든 컨소시엄은 다시 만들어야 함 |
+| `signing.key` | Ed25519 시드 | 두 키를 유도하는 시드 |
+| 파일 서명 | 없음 | `sign-keygen`, `sign`, `verify-signature` |
+| 패키지 | 릴리스 파일만 | 컨테이너 이미지 `ghcr.io/aetherx86/medcrypto` 추가 |
+| 라이선스 | CC BY-ND 4.0 | CC BY-NC-ND 4.0 |
+
+BFV는 라이브러리와 데모에 있고, 데몬, 명령줄, Wasm Component에는 아직 없습니다. TLS와 Pedersen 백엔드는 여전히 양자 내성이 아닙니다.
+`noise_budget_bits`로 BFV 암호문의 남은 여유를 볼 수 있으며, 1비트 미만이면 답이 틀립니다.
+
 ## 0.2.2
 
 - License: from proprietary to Creative Commons Attribution-NoDerivatives 4.0 International (CC BY-ND 4.0), from this version on.

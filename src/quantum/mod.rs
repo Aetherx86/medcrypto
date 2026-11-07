@@ -58,7 +58,8 @@ impl QuantumAuditor {
             post_quantum_recommendations: vec![
                 "CKKS rests on RLWE, for which no efficient quantum attack is known.".to_string(),
                 "SHA-256 chains keep about 128 bits against Grover's preimage search.".to_string(),
-                "The Pedersen backend, Ed25519 signatures and TLS certificates all rest on elliptic curves, which Shor's algorithm breaks. Use a post-quantum runner for proofs in production, and treat the signatures and TLS as needing their own migration.".to_string(),
+                "Consortium messages carry both Ed25519 and ML-DSA-65 signatures, and verifying needs both, so forging one takes breaking ML-DSA too.".to_string(),
+                "The Pedersen backend and TLS certificates rest on elliptic curves, which Shor's algorithm breaks. Use a post-quantum runner for proofs in production, and treat TLS as needing its own migration.".to_string(),
             ],
         }
     }

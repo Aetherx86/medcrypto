@@ -9,7 +9,7 @@ use medcrypto::consortium::{
     bootstrap_consortium, query_status, run_daemon, BootstrapNode, NodeConfig,
 };
 use medcrypto::fhe::{
-    to_bytes, CKKSEngine, Ciphertext, CkksPreset, GaloisKey, PublicKey, SecretKey,
+    to_bytes, BfvEngine, CKKSEngine, Ciphertext, CkksPreset, GaloisKey, PublicKey, SecretKey,
 };
 use medcrypto::fhir::client::{fetch_observations, ClientOptions};
 use medcrypto::fhir::pipeline::Row;
@@ -21,6 +21,9 @@ use medcrypto::models::PatientRecord;
 use medcrypto::packing::vertical::AnalyteStatistics;
 use medcrypto::packing::{CohortFile, RecordEnvelope};
 use medcrypto::quantum::QuantumAuditor;
+use medcrypto::signatures::{
+    verify as signature_verify, HybridPublicKey, HybridSignature, HybridSigningKey,
+};
 use medcrypto::zkp::{
     backend_for_profile, Profile, StarkCoprocessorBackend, ThresholdProof, ZKPEngine,
 };
@@ -34,7 +37,7 @@ mod license;
 #[command(name = "medcrypto")]
 #[command(author = "Jeong Hoon Kim")]
 #[command(version)]
-#[command(about = "Privacy-preserving healthcare data sharing: RNS-CKKS, threshold decryption, range proofs, FHIR ingestion and a consortium daemon", long_about = None)]
+#[command(about = "Privacy-preserving healthcare data sharing: RNS-CKKS and RNS-BFV, threshold decryption, range proofs, hybrid ML-DSA signatures, FHIR ingestion and a consortium daemon", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -281,6 +284,37 @@ enum Commands {
         key_store: PathBuf,
     },
 
+    /// Generate a hybrid Ed25519 and ML-DSA-65 signing key
+    SignKeygen {
+        #[arg(short, long)]
+        output_dir: PathBuf,
+    },
+
+    /// Sign a file with both algorithms
+    Sign {
+        #[arg(short, long)]
+        key: PathBuf,
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// What this signature is for, so that it cannot be reused for something else
+        #[arg(long, default_value = "medcrypto-file")]
+        context: String,
+    },
+
+    /// Check a file's signature. Both algorithms have to pass
+    VerifySignature {
+        #[arg(long)]
+        public_key: PathBuf,
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        signature: PathBuf,
+        #[arg(long, default_value = "medcrypto-file")]
+        context: String,
+    },
+
     /// Check parameters against the Homomorphic Encryption Standard
     QuantumAudit {
         #[arg(long, default_value_t = 8192)]
@@ -464,6 +498,19 @@ fn main() {
             record_id,
             key_store,
         }) => shred(&record_id, &key_store),
+        Some(Commands::SignKeygen { output_dir }) => sign_keygen(&output_dir),
+        Some(Commands::Sign {
+            key,
+            input,
+            output,
+            context,
+        }) => sign_file(&key, &input, &output, &context),
+        Some(Commands::VerifySignature {
+            public_key,
+            input,
+            signature,
+            context,
+        }) => verify_signature(&public_key, &input, &signature, &context),
         Some(Commands::QuantumAudit { poly_degree }) => {
             engine_for(poly_degree).map(|e| quantum_audit(&e))
         }
@@ -1209,6 +1256,56 @@ fn shred(record_id: &str, key_store: &Path) -> CliResult {
     Ok(())
 }
 
+fn sign_keygen(directory: &Path) -> CliResult {
+    let key = HybridSigningKey::generate();
+    medcrypto::consortium::write_private_file(
+        &directory.join("signing-key.hex"),
+        hex::encode(key.seed()).as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
+    write_json(&directory.join("signing-public.json"), key.public_key())?;
+    println!(
+        "[SUCCESS] Ed25519 and ML-DSA-65 keys written to {}",
+        directory.display()
+    );
+    println!("          signing-key.hex stays private. signing-public.json can be shared.");
+    Ok(())
+}
+
+fn sign_file(key: &Path, input: &Path, output: &Path, context: &str) -> CliResult {
+    let text = fs::read_to_string(key).map_err(|e| format!("{key:?}: {e}"))?;
+    let seed: [u8; 32] = hex::decode(text.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| format!("{key:?} is not 32 bytes of hex"))?;
+    let message = fs::read(input).map_err(|e| format!("{input:?}: {e}"))?;
+    let signature = HybridSigningKey::from_seed(&seed).sign(context.as_bytes(), &message)?;
+    write_json(output, &signature)?;
+    println!(
+        "[SUCCESS] Signed {} into {}",
+        input.display(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn verify_signature(public_key: &Path, input: &Path, signature: &Path, context: &str) -> CliResult {
+    let public: HybridPublicKey = read_json(public_key)?;
+    let signature: HybridSignature = read_json(signature)?;
+    let message = fs::read(input).map_err(|e| format!("{input:?}: {e}"))?;
+    if signature_verify(&public, context.as_bytes(), &message, &signature) {
+        println!(
+            "{}",
+            "[VERIFIED] Both the Ed25519 and the ML-DSA-65 signature hold."
+                .bold()
+                .green()
+        );
+        Ok(())
+    } else {
+        Err("[FAILED] The signature does not verify.".to_string())
+    }
+}
+
 fn quantum_audit(engine: &CKKSEngine) {
     let report = QuantumAuditor::evaluate_context(engine.context());
     let mut table = Table::new();
@@ -1559,10 +1656,58 @@ fn run_interactive_demo() {
         envelope.open(&engine, &keychain).unwrap_err()
     );
 
-    step("[STEP 8] Post-quantum status");
+    step("[STEP 8] BFV: an exact count, where CKKS would only be approximate");
+    let bfv = BfvEngine::new(CkksPreset::N8192, 20).expect("a valid modulus");
+    let (bfv_secret, bfv_public) = bfv.keygen();
+    let bfv_galois = bfv.sum_galois_keygen(&bfv_secret);
+    let flags_a: Vec<i64> = (0..300).map(|i| (i % 3 == 0) as i64).collect();
+    let flags_b: Vec<i64> = (0..500).map(|i| (i % 5 == 0) as i64).collect();
+    let site_a = bfv.encrypt(&bfv_public, &flags_a).expect("fits");
+    let site_b = bfv.encrypt(&bfv_public, &flags_b).expect("fits");
+    let counted = bfv
+        .sum_all(
+            &bfv.add(&site_a, &site_b).expect("same parameters"),
+            &bfv_galois,
+        )
+        .expect("keys match");
+    println!(
+        "  * Patients meeting a criterion at two sites: {} (the true count is 200)",
+        bfv.decrypt(&bfv_secret, &counted).expect("our key")[0]
+    );
+
+    step("[STEP 9] Hybrid signature: Ed25519 and ML-DSA-65 together");
+    let signer = HybridSigningKey::generate();
+    let signature = signer
+        .sign(b"demo", b"released statistics")
+        .expect("signing works");
+    println!(
+        "  * Signature of {} + {} bytes. Valid: {}",
+        signature.ed25519.len(),
+        signature.ml_dsa_65.len(),
+        signature_verify(
+            signer.public_key(),
+            b"demo",
+            b"released statistics",
+            &signature
+        )
+    );
+    let mut stripped = signature.clone();
+    stripped.ml_dsa_65.clear();
+    println!(
+        "  * With the ML-DSA part removed. Valid: {}",
+        signature_verify(
+            signer.public_key(),
+            b"demo",
+            b"released statistics",
+            &stripped
+        )
+    );
+
+    step("[STEP 10] Post-quantum status");
     let report = QuantumAuditor::evaluate_context(engine.context());
     println!("  * {}", report.security_assessment);
-    println!("  * Pedersen proofs are not post-quantum, so production needs the STARK runner.");
+    println!("  * Signatures on consortium messages are hybrid, with ML-DSA-65.");
+    println!("  * Pedersen proofs and TLS certificates are not post-quantum. Production proofs need the STARK runner.");
 
     println!(
         "\n{}",

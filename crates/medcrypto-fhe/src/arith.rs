@@ -170,6 +170,22 @@ pub fn ntt_primes(bits: u32, degree: usize, count: usize) -> Vec<u64> {
     found
 }
 
+/// The largest prime below `2^bits` that is 1 mod `2 * degree` and is not excluded, if there is one. Few
+/// primes of this form exist when `bits` is small and `degree` is large.
+pub fn largest_ntt_prime_excluding(bits: u32, degree: usize, exclude: &[u64]) -> Option<u64> {
+    let step = 2 * degree as u64;
+    let mut candidate = (1u64 << bits) - ((1u64 << bits) % step) + 1;
+    loop {
+        candidate = candidate.checked_sub(step)?;
+        if candidate >> (bits - 1) != 1 {
+            return None;
+        }
+        if is_prime(candidate) && !exclude.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

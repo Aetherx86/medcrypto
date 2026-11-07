@@ -162,7 +162,7 @@ pub fn os_seeded_rng() -> rand_chacha::ChaCha20Rng {
     rand_chacha::ChaCha20Rng::from_rng(rand_core::OsRng).expect("the OS random source failed")
 }
 
-fn sample_ternary<R: RngCore>(degree: usize, rng: &mut R) -> Vec<i64> {
+pub(crate) fn sample_ternary<R: RngCore>(degree: usize, rng: &mut R) -> Vec<i64> {
     (0..degree)
         .map(|_| loop {
             // Rejection on two random bits. What it reveals in timing says nothing of the accepted value.
@@ -228,7 +228,7 @@ impl CKKSEngine {
         self.ctx.slots()
     }
 
-    fn modulus(&self, table: usize) -> Modulus {
+    pub(crate) fn modulus(&self, table: usize) -> Modulus {
         self.ctx.tables[table].modulus
     }
 
@@ -496,9 +496,19 @@ impl CKKSEngine {
         steps: &[i64],
         rng: &mut R,
     ) -> GaloisKey {
+        let elements: Vec<u32> = steps.iter().map(|&s| self.galois_element(s)).collect();
+        self.galois_keygen_for_elements(sk, &elements, rng)
+    }
+
+    /// Keys for the automorphisms themselves, which is the only way to name one that is not a rotation.
+    pub(crate) fn galois_keygen_for_elements<R: RngCore + CryptoRng>(
+        &self,
+        sk: &SecretKey,
+        elements: &[u32],
+        rng: &mut R,
+    ) -> GaloisKey {
         let mut keys = BTreeMap::new();
-        for &step in steps {
-            let g = self.galois_element(step);
+        for &g in elements {
             keys.entry(g).or_insert_with(|| {
                 let permutation = galois_permutation(self.ctx.poly_degree, g as u64);
                 let mut rotated = self.automorphism(&sk.s, &permutation);
@@ -945,7 +955,7 @@ impl CKKSEngine {
     }
 
     /// Hybrid key switching with one digit per prime: returns the pair that decrypts to `c * new_key`.
-    fn key_switch(&self, c: &RnsPoly, key: &KeySwitchKey) -> (RnsPoly, RnsPoly) {
+    pub(crate) fn key_switch(&self, c: &RnsPoly, key: &KeySwitchKey) -> (RnsPoly, RnsPoly) {
         let n = self.ctx.poly_degree;
         let level = c.limb_count() - 1;
         let special = self.ctx.special_index();

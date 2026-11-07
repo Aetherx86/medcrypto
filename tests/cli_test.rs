@@ -321,6 +321,47 @@ fn shredding_really_destroys_the_key_across_processes() {
 }
 
 #[test]
+fn hybrid_signatures_through_the_command_line() {
+    let directory = tempfile::tempdir().unwrap();
+    let cwd = directory.path();
+    succeed(cwd, &["sign-keygen", "--output-dir", "sign"]);
+    std::fs::write(cwd.join("result.json"), b"{\"count\": 1500}").unwrap();
+    succeed(
+        cwd,
+        &[
+            "sign",
+            "--key",
+            "sign/signing-key.hex",
+            "--input",
+            "result.json",
+            "--output",
+            "result.sig",
+        ],
+    );
+    let verify = [
+        "verify-signature",
+        "--public-key",
+        "sign/signing-public.json",
+        "--input",
+        "result.json",
+        "--signature",
+        "result.sig",
+    ];
+    assert!(succeed(cwd, &verify).contains("VERIFIED"));
+
+    std::fs::write(cwd.join("result.json"), b"{\"count\": 1501}").unwrap();
+    assert!(!medcrypto(cwd, &verify).status.success());
+    std::fs::write(cwd.join("result.json"), b"{\"count\": 1500}").unwrap();
+
+    // Removing the post-quantum half does not leave a valid signature.
+    let mut signature: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cwd.join("result.sig")).unwrap()).unwrap();
+    signature["ml_dsa_65"] = "".into();
+    std::fs::write(cwd.join("result.sig"), signature.to_string()).unwrap();
+    assert!(!medcrypto(cwd, &verify).status.success());
+}
+
+#[test]
 fn encrypt_decrypt_and_quantum_audit() {
     let directory = tempfile::tempdir().unwrap();
     let cwd = directory.path();

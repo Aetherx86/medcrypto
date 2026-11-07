@@ -10,18 +10,20 @@ opt-level = 3
 
 [package]
 name = "medcrypto"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 authors = ["Jeong Hoon Kim"]
-description = "Privacy-preserving cross-institutional healthcare data sharing: RNS-CKKS, threshold decryption, range proofs, FHIR ingestion and a consortium daemon"
-license = "CC-BY-ND-4.0"
+description = "Privacy-preserving cross-institutional healthcare data sharing: RNS-CKKS and RNS-BFV, threshold decryption, range proofs, hybrid ML-DSA signatures, FHIR ingestion and a consortium daemon"
+license = "CC-BY-NC-ND-4.0"
 publish = false
 readme = "README.md"
 
 [dependencies]
 medcrypto-fhe = { path = "crates/medcrypto-fhe" }
 medcrypto-fhir = { path = "crates/medcrypto-fhir" }
+fips204 = { version = "0.5", default-features = false, features = ["default-rng", "ml-dsa-65"] }
 curve25519-dalek = { version = "4", features = ["digest", "rand_core"] }
+serde_bytes = "0.11"
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 sha3 = "0.10"
 zeroize = "1"

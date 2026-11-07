@@ -6,6 +6,7 @@ pub mod gui;
 pub mod models;
 pub mod packing;
 pub mod quantum;
+pub mod signatures;
 pub mod zkp;
 
 /// The homomorphic encryption engine, which lives in its own crate so that the Wasm component can use it.

@@ -18,6 +18,8 @@ message Envelope {
   bytes payload = 3;
   // Ed25519 over the consortium, sender, recipient and hash of the payload.
   bytes signature = 4;
+  // ML-DSA-65 over the same thing. A message needs both to be accepted.
+  bytes pq_signature = 5;
 }
 
 message Ack {}

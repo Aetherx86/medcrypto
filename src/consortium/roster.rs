@@ -1,6 +1,7 @@
 //! Membership, and the bootstrap that creates certificates and keys.
 
 use super::write_private_file;
+use crate::signatures::{HybridPublicKey, HybridSigningKey};
 use medcrypto_fhe::threshold::DEFAULT_SMUDGING_BITS;
 use rand::RngCore;
 use rcgen::{
@@ -22,8 +23,8 @@ pub struct RosterNode {
     pub endpoint: String,
     /// SHA-256 of its certificate, so that the CA alone cannot add a member.
     pub cert_sha256: String,
-    /// Its Ed25519 message-signing key, as hexadecimal.
-    pub signing_public_key: String,
+    /// Its hybrid message-signing keys, Ed25519 and ML-DSA-65.
+    pub signing_public_key: HybridPublicKey,
 }
 
 /// The shared description of the consortium. Every node needs the same one.
@@ -197,12 +198,10 @@ pub fn bootstrap_consortium(
         write_private_file(&directory.join("key.pem"), key.serialize_pem().as_bytes())
             .map_err(|e| e.to_string())?;
 
-        let mut signing_seed = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut signing_seed);
-        let signing = ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new(signing_seed));
+        let signing = HybridSigningKey::generate();
         write_private_file(
             &directory.join("signing.key"),
-            hex::encode(signing_seed).as_bytes(),
+            hex::encode(signing.seed()).as_bytes(),
         )
         .map_err(|e| e.to_string())?;
 
@@ -211,7 +210,7 @@ pub fn bootstrap_consortium(
             party: index as u32 + 1,
             endpoint: node.endpoint.clone(),
             cert_sha256: hex::encode(Sha256::digest(cert.der())),
-            signing_public_key: hex::encode(*signing.pk),
+            signing_public_key: signing.public_key().clone(),
         });
         let config = NodeConfig {
             node_id: node.id.clone(),

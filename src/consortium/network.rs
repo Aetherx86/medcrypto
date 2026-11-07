@@ -2,12 +2,14 @@
 //!
 //! Inbound, a message has to clear three checks before the protocol sees it. The TLS layer checks that the
 //! peer's certificate chains to the consortium's CA. The service checks that the certificate's hash is the
-//! one the roster lists for the claimed sender. And the Ed25519 signature has to cover this consortium,
-//! sender, recipient and payload, so that a recorded message cannot be replayed to a different node.
+//! one the roster lists for the claimed sender. And both an Ed25519 and an ML-DSA-65 signature have to cover
+//! this consortium, sender, recipient and payload, so that a recorded message cannot be replayed to a different
+//! node, and so that forging one takes breaking both algorithms.
 
 use super::consent::{ConsentSource, EvmConsentSource, FileConsentLedger};
 use super::core::{ConsortiumCore, Message, NodeStatus};
 use super::roster::{ConsentConfig, NodeConfig, Roster};
+use crate::signatures::{verify, HybridSignature, HybridSigningKey};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -45,6 +47,35 @@ fn signed_bytes(consortium: &str, sender: &str, recipient: &str, payload: &[u8])
     }
     out.extend_from_slice(&Sha256::digest(payload));
     out
+}
+
+const SIGNATURE_CONTEXT: &[u8] = b"medcrypto-consortium-envelope";
+
+/// Both signatures on a message have to hold, for the node that the roster says sent it.
+fn check_envelope(
+    roster: &Roster,
+    sender: &str,
+    me: &str,
+    envelope: &Envelope,
+) -> Result<(), Status> {
+    let node = roster
+        .node(sender)
+        .ok_or_else(|| Status::permission_denied("the sender is not in the roster"))?;
+    let signed = signed_bytes(&roster.consortium_id, sender, me, &envelope.payload);
+    let signature = HybridSignature {
+        ed25519: envelope.signature.clone(),
+        ml_dsa_65: envelope.pq_signature.clone(),
+    };
+    if verify(
+        &node.signing_public_key,
+        SIGNATURE_CONTEXT,
+        &signed,
+        &signature,
+    ) {
+        Ok(())
+    } else {
+        Err(Status::unauthenticated("bad signature"))
+    }
 }
 
 struct NodeService {
@@ -93,25 +124,7 @@ impl ConsortiumNode for NodeService {
                 "this message is for another node",
             ));
         }
-        let node = self
-            .roster
-            .node(&sender)
-            .expect("authenticated from the roster");
-        let public = hex::decode(&node.signing_public_key)
-            .ok()
-            .and_then(|b| ed25519_compact::PublicKey::from_slice(&b).ok())
-            .ok_or_else(|| Status::internal("bad key in the roster"))?;
-        let signature = ed25519_compact::Signature::from_slice(&envelope.signature)
-            .map_err(|_| Status::unauthenticated("malformed signature"))?;
-        let signed = signed_bytes(
-            &self.roster.consortium_id,
-            &sender,
-            &self.me,
-            &envelope.payload,
-        );
-        public
-            .verify(signed, &signature)
-            .map_err(|_| Status::unauthenticated("bad signature"))?;
+        check_envelope(&self.roster, &sender, &self.me, &envelope)?;
         let message: Message = postcard::from_bytes(&envelope.payload)
             .map_err(|e| Status::invalid_argument(format!("undecodable message: {e}")))?;
         self.events
@@ -279,8 +292,8 @@ pub async fn run_daemon(config: NodeConfig) -> Result<DaemonHandle, String> {
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or("the signing key is not 32 bytes of hex")?;
-    let signing = ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new(seed));
-    if hex::encode(*signing.pk) != me.signing_public_key {
+    let signing = HybridSigningKey::from_seed(&seed);
+    if signing.public_key() != &me.signing_public_key {
         return Err("the signing key is not the one the roster lists".to_string());
     }
 
@@ -327,16 +340,23 @@ pub async fn run_daemon(config: NodeConfig) -> Result<DaemonHandle, String> {
                             continue;
                         }
                     };
-                    let signature = signing.sk.sign(
-                        signed_bytes(&roster.consortium_id, &me_id, &outgoing.to, &payload),
-                        None,
-                    );
+                    let signature = match signing.sign(
+                        SIGNATURE_CONTEXT,
+                        &signed_bytes(&roster.consortium_id, &me_id, &outgoing.to, &payload),
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[daemon] {me_id}: could not sign: {e}");
+                            continue;
+                        }
+                    };
                     if let Some(peer) = peers.get(&outgoing.to) {
                         let _ = peer.send(Envelope {
                             sender: me_id.clone(),
                             recipient: outgoing.to.clone(),
                             payload,
-                            signature: signature.to_vec(),
+                            signature: signature.ed25519,
+                            pq_signature: signature.ml_dsa_65,
                         });
                     }
                 }
@@ -456,4 +476,86 @@ pub async fn query_status(config: &NodeConfig, target: &str) -> Result<StatusRep
         .await
         .map_err(|e| e.to_string())?;
     Ok(reply.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consortium::roster::RosterNode;
+
+    fn setup() -> (Roster, HybridSigningKey) {
+        let key = HybridSigningKey::from_seed(&[3; 32]);
+        let roster = Roster {
+            consortium_id: "c".into(),
+            threshold_k: 1,
+            poly_degree: 8192,
+            crs_seed: "00".repeat(32),
+            smudging_bits: 24,
+            nodes: vec![RosterNode {
+                id: "a".into(),
+                party: 1,
+                endpoint: "https://127.0.0.1:1".into(),
+                cert_sha256: "00".repeat(32),
+                signing_public_key: key.public_key().clone(),
+            }],
+        };
+        (roster, key)
+    }
+
+    fn envelope(
+        key: &HybridSigningKey,
+        consortium: &str,
+        recipient: &str,
+        payload: &[u8],
+    ) -> Envelope {
+        let signature = key
+            .sign(
+                SIGNATURE_CONTEXT,
+                &signed_bytes(consortium, "a", recipient, payload),
+            )
+            .unwrap();
+        Envelope {
+            sender: "a".into(),
+            recipient: recipient.into(),
+            payload: payload.to_vec(),
+            signature: signature.ed25519,
+            pq_signature: signature.ml_dsa_65,
+        }
+    }
+
+    #[test]
+    fn an_envelope_needs_both_signatures_and_the_right_addressee() {
+        let (roster, key) = setup();
+        let good = envelope(&key, "c", "b", b"payload");
+        assert!(check_envelope(&roster, "a", "b", &good).is_ok());
+
+        // A quantum attacker who can forge Ed25519 still has to get past ML-DSA, and the reverse.
+        let mut no_pq = good.clone();
+        no_pq.pq_signature = Vec::new();
+        assert!(check_envelope(&roster, "a", "b", &no_pq).is_err());
+        let mut no_classical = good.clone();
+        no_classical.signature = Vec::new();
+        assert!(check_envelope(&roster, "a", "b", &no_classical).is_err());
+
+        let mut tampered = good.clone();
+        tampered.payload = b"changed".to_vec();
+        assert!(check_envelope(&roster, "a", "b", &tampered).is_err());
+
+        // A recorded message cannot be replayed to another node, or in another consortium.
+        assert!(check_envelope(&roster, "a", "c", &good).is_err());
+        assert!(
+            check_envelope(&roster, "a", "b", &envelope(&key, "other", "b", b"payload")).is_err()
+        );
+
+        // A key that is not the roster's does not count, and neither does a sender who is not in it.
+        let stranger = HybridSigningKey::from_seed(&[4; 32]);
+        assert!(check_envelope(
+            &roster,
+            "a",
+            "b",
+            &envelope(&stranger, "c", "b", b"payload")
+        )
+        .is_err());
+        assert!(check_envelope(&roster, "nobody", "b", &good).is_err());
+    }
 }
