@@ -31,9 +31,9 @@ readme = "README.md"
 medcrypto-fhe = { path = "crates/medcrypto-fhe" }
 medcrypto-fhir = { path = "crates/medcrypto-fhir" }
 medcrypto-pq = { path = "crates/medcrypto-pq" }
-curve25519-dalek = { version = "4", features = ["digest", "rand_core"] }
+curve25519-dalek = { version = "5", features = ["digest", "rand_core"] }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
-sha3 = "0.10"
+sha3 = "0.12"
 zeroize = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -43,20 +43,20 @@ tonic-prost = "0.14"
 prost = "0.14"
 rcgen = "0.14"
 ureq = "3"
-rand_chacha = "0.3"
+rand_chacha = "0.10"
 ed25519-compact = "2.1"
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-rand = "0.8"
-rand_distr = "0.4"
-sha2 = "0.10"
+rand = "0.10"
+rand_distr = "0.6"
+sha2 = "0.11"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
-colored = "2.0"
-comfy-table = "7.1"
-aes-gcm = "0.10"
-eframe = "0.29"
+colored = "3.1"
+comfy-table = "8.0"
+aes-gcm = "0.11"
+eframe = "0.37"
 
 [build-dependencies]
 protox = "0.10"
